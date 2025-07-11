@@ -21,12 +21,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import torch
+from tensordict import TensorDict
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictSequential
 from torchrl.collectors import SyncDataCollector
 
 from torchrl.envs import ParallelEnv, SerialEnv, TransformedEnv
-from torchrl.envs.transforms import Compose
+from torchrl.envs.transforms import Compose, Transform, RemoveEmptySpecs, BatchSizeTransform, RewardSum
+from torchrl.data.tensor_specs import CompositeSpec
 from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
 from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
@@ -45,11 +47,35 @@ from benchmarl.utils import (
     local_seed,
     seed_everything,
 )
+import multiprocessing
+from torch.profiler import profile, record_function, ProfilerActivity
 
 _has_hydra = importlib.util.find_spec("hydra") is not None
 if _has_hydra:
     from hydra.core.hydra_config import HydraConfig
 
+class OuterPatchedTransformedEnv(TransformedEnv):
+    """
+    一个专门用于包装 ParallelEnv 和处理批处理维度变换的 TransformedEnv 最终补丁。
+    它通过只调用其基础环境的公共接口（.reset() 和 .step()）来确保正确性。
+    """
+    def _reset(self, tensordict: TensorDictBase | None = None, **kwargs) -> TensorDictBase:
+        # 预处理输入
+        tensordict = self.transform._reset_env_preprocess(tensordict)
+        # 始终调用 base_env 的【公共 reset()】方法
+        tensordict_reset = self.base_env.reset(tensordict, **kwargs)
+        # 应用 transform 的 reset 逻辑
+        tensordict_reset = self.transform._reset(tensordict_reset.empty(), tensordict_reset)
+        return tensordict_reset
+
+    def _step(self, tensordict: TensorDictBase) -> TensorDictBase:
+        # 1. 对输入进行逆向变换
+        tensordict_in = self.transform.inv(tensordict)
+        # 2. 调用 base_env 的【公共 step()】方法
+        next_tensordict = self.base_env.step(tensordict_in)
+        # 3. 对返回结果应用正向变换
+        next_tensordict = self.transform._step(tensordict_in, next_tensordict)
+        return next_tensordict
 
 @dataclass
 class ExperimentConfig:
@@ -120,6 +146,9 @@ class ExperimentConfig:
     checkpoint_interval: int = MISSING
     checkpoint_at_end: bool = MISSING
     keep_checkpoints_num: Optional[int] = MISSING
+
+    evaluation_device: str = "cpu" 
+    n_workers: int = 4
 
     def train_batch_size(self, on_policy: bool) -> int:
         """
@@ -314,6 +343,169 @@ class ExperimentConfig:
             )
 
 
+def _run_evaluation_process(
+    experiment_config: ExperimentConfig,
+    algorithm_config: AlgorithmConfig,
+    model_config: ModelConfig,
+    critic_model_config: ModelConfig,
+    task: Task,
+    group_map: Dict,
+    seed: int,
+    continuous_actions: bool,
+    policy_state_dict: Dict,
+    total_frames: int,
+    n_iters_performed: int,
+    experiment_name: str,
+    folder_name: Path,
+):
+    """
+    This function is designed to be run in a separate process for evaluation.
+    It rebuilds all necessary components on the specified evaluation device.
+    """
+    # ====================================================================
+    # 1. SETUP: Set device and seed for this independent process
+    # ====================================================================
+    eval_device = experiment_config.evaluation_device
+    seed_everything(seed)
+    print(f"[Eval Process]: Starting evaluation on device '{eval_device}'.")
+
+    # ====================================================================
+    # 2. REBUILD ENVIRONMENT AND GET SPECS *FIRST*
+    # ====================================================================
+    # We must create the environment first to get its specifications.
+    test_env = task.get_env_fun(
+        num_envs=experiment_config.evaluation_episodes,
+        continuous_actions=continuous_actions,
+        seed=seed,
+        device=eval_device,
+    )()
+    
+    # Get all specs from the created environment
+    observation_spec = task.observation_spec(test_env)
+    action_spec = task.action_spec(test_env)
+    info_spec = task.info_spec(test_env)
+    state_spec = task.state_spec(test_env)
+    action_mask_spec = task.action_mask_spec(test_env)
+
+    # ====================================================================
+    # 3. REBUILD ALGORITHM and OTHER COMPONENTS
+    # ====================================================================
+
+    # Now, create a more complete shell that includes the specs
+    class ExperimentShell:
+        def __init__(self):
+            self.config = experiment_config
+            self.algorithm_config = algorithm_config
+            self.model_config = model_config
+            self.critic_model_config = critic_model_config
+            self.task = task
+            self.group_map = group_map
+            self.continuous_actions = continuous_actions
+            self.seed = seed
+            self.on_policy = self.algorithm_config.on_policy()
+
+            # Pass the retrieved specs
+            self.observation_spec = observation_spec
+            self.action_spec = action_spec
+            self.info_spec = info_spec
+            self.state_spec = state_spec
+            self.action_mask_spec = action_mask_spec
+
+    exp_shell = ExperimentShell()
+    algorithm = algorithm_config.get_algorithm(exp_shell)
+
+    # Now that the algorithm is created, we can finish setting up the env
+    transforms_env = Compose(*task.get_env_transforms(test_env))
+    test_env = TransformedEnv(test_env, transforms_env.clone()).to(eval_device)
+    if model_config.is_rnn:
+        test_env = _add_rnn_transforms(lambda: test_env, group_map, model_config)()
+    test_env = algorithm.process_env_fun(lambda: test_env)()
+
+    if experiment_config.evaluation_static:
+        try:
+            test_env.set_seed(seed)
+        except NotImplementedError:
+            warnings.warn(
+                "`experiment.evaluation_static` set to true but the environment does not allow to set seeds."
+            )
+
+    # Rebuild the policy on the correct device and load its weights
+    eval_policy = algorithm.get_policy_for_collection()
+    eval_policy.to(eval_device)
+    eval_policy.load_state_dict(policy_state_dict)
+    eval_policy.eval()
+
+    # Rebuild a logger instance
+    logger = Logger(
+        experiment_name=experiment_name,
+        folder_name=str(folder_name),
+        experiment_config=experiment_config,
+        algorithm_name=algorithm_config.associated_class().__name__.lower(),
+        model_name=model_config.associated_class().__name__.lower(),
+        environment_name=task.env_name().lower(),
+        task_name=task.name.lower(),
+        group_map=group_map,
+        seed=seed,
+        project_name=experiment_config.project_name,
+        wandb_extra_kwargs=experiment_config.wandb_extra_kwargs,
+    )
+
+    # ====================================================================
+    # 4. RUN ROLLOUTS: Perform the evaluation
+    # ====================================================================
+    evaluation_start = time.time()
+    with set_exploration_type(
+        ExplorationType.DETERMINISTIC
+        if experiment_config.evaluation_deterministic_actions
+        else ExplorationType.RANDOM
+    ):
+        if task.has_render(test_env) and experiment_config.render:
+            video_frames = []
+            def callback(env, td):
+                video_frames.append(task.__class__.render_callback(exp_shell, env, td))
+        else:
+            video_frames = None
+            callback = None
+
+        if test_env.batch_size == ():
+            rollouts = []
+            for eval_episode in range(experiment_config.evaluation_episodes):
+                rollouts.append(
+                    test_env.rollout(
+                        max_steps=task.max_steps(test_env),
+                        policy=eval_policy,
+                        callback=callback if eval_episode == 0 else None,
+                        auto_cast_to_device=True,
+                        break_when_any_done=True,
+                    )
+                )
+        else:
+            rollouts = test_env.rollout(
+                max_steps=task.max_steps(test_env),
+                policy=eval_policy,
+                callback=callback,
+                auto_cast_to_device=True,
+                break_when_any_done=False,
+            )
+            rollouts = list(rollouts.unbind(0))
+
+    # ====================================================================
+    # 5. LOG & CLEANUP: Report results and close resources
+    # ====================================================================
+    test_env.close()
+
+    evaluation_time = time.time() - evaluation_start
+    logger.log({"timers/evaluation_time": evaluation_time}, step=n_iters_performed)
+    logger.log_evaluation(
+        rollouts,
+        video_frames=video_frames,
+        step=n_iters_performed,
+        total_frames=total_frames,
+    )
+    logger.commit()
+    logger.finish()
+    print(f"\n[Eval Process]: Evaluation for iteration {n_iters_performed} complete. Results logged.")
+
 class Experiment(CallbackNotifier):
     """
     Main experiment class in BenchMARL.
@@ -342,6 +534,8 @@ class Experiment(CallbackNotifier):
         critic_model_config: Optional[ModelConfig] = None,
         callbacks: Optional[List[Callback]] = None,
     ):
+
+        multiprocessing.set_start_method("spawn", force=True)
         super().__init__(
             experiment=self, callbacks=callbacks if callbacks is not None else []
         )
@@ -372,6 +566,8 @@ class Experiment(CallbackNotifier):
         self.total_frames = 0
         self.n_iters_performed = 0
         self.mean_return = 0
+
+        self.evaluation_process: Optional[multiprocessing.Process] = None
 
         if self.config.restore_file is not None:
             self._load_experiment()
@@ -443,62 +639,109 @@ class Experiment(CallbackNotifier):
             )
 
     def _setup_task(self):
+        # 步骤 1：在 CPU 上创建临时的测试环境，用于获取元数据
+        # 这是为了避免在主进程中初始化CUDA资源
         test_env = self.task.get_env_fun(
             num_envs=self.config.evaluation_episodes,
             continuous_actions=self.continuous_actions,
             seed=self.seed,
-            device=self.config.sampling_device,
+            device="cpu",  # 关键修改：在CPU上创建
         )()
+
+        # 步骤 2：立即从测试环境中获取所有元数据
+        # 确保在使用 group_map 等变量前就完成定义
+        self.observation_spec = self.task.observation_spec(test_env)
+        self.info_spec = self.task.info_spec(test_env)
+        self.state_spec = self.task.state_spec(test_env)
+        self.action_mask_spec = self.task.action_mask_spec(test_env)
+        self.action_spec = self.task.action_spec(test_env)
+        self.group_map = self.task.group_map(test_env)
+        self.train_group_map = copy.deepcopy(self.group_map)
+        self.max_steps = self.task.max_steps(test_env)
+
+        # 步骤 3：定义基础环境创建函数，同样确保在 CPU 上创建
+        # 这个函数将被序列化后发送到各个子进程
         env_func = self.task.get_env_fun(
             num_envs=self.config.n_envs_per_worker(self.on_policy),
             continuous_actions=self.continuous_actions,
             seed=self.seed,
-            device=self.config.sampling_device,
+            device="cpu",  # 关键修改：在CPU上创建
         )
 
-        transforms_env = self.task.get_env_transforms(test_env)
-        transforms_training = transforms_env + [
-            self.task.get_reward_sum_transform(test_env)
-        ]
-        transforms_env = Compose(*transforms_env)
-        transforms_training = Compose(*transforms_training)
-
-        # Initialize test env
-        self.test_env = TransformedEnv(test_env, transforms_env.clone()).to(
-            self.config.sampling_device
-        )
-
-        self.observation_spec = self.task.observation_spec(self.test_env)
-        self.info_spec = self.task.info_spec(self.test_env)
-        self.state_spec = self.task.state_spec(self.test_env)
-        self.action_mask_spec = self.task.action_mask_spec(self.test_env)
-        self.action_spec = self.task.action_spec(self.test_env)
-        self.group_map = self.task.group_map(self.test_env)
-        self.train_group_map = copy.deepcopy(self.group_map)
-        self.max_steps = self.task.max_steps(self.test_env)
-
-        # Add rnn transforms here so they do not show in the benchmarl specs
+        # 步骤 4：应用RNN转换（这是可能产生空规格问题的步骤）
         if self.model_config.is_rnn:
-            self.test_env = _add_rnn_transforms(
-                lambda: self.test_env, self.group_map, self.model_config
+            test_env = _add_rnn_transforms(
+                lambda: test_env, self.group_map, self.model_config
             )()
             env_func = _add_rnn_transforms(env_func, self.group_map, self.model_config)
 
-        # Initialize train env
-        if self.test_env.batch_size == ():
-            # If the environment is not vectorized, we simulate vectorization using parallel or serial environments
-            env_class = (
-                SerialEnv if not self.config.parallel_collection else ParallelEnv
-            )
-            self.env_func = lambda: TransformedEnv(
-                env_class(self.config.n_envs_per_worker(self.on_policy), env_func),
-                transforms_training.clone(),
-            )
-        else:
-            # Otherwise it is already vectorized
-            self.env_func = lambda: TransformedEnv(
-                env_func(), transforms_training.clone()
-            )
+        # 步骤 5：【核心修正】在RNN转换之后，清理它可能产生的任何空规格
+        # 我们在这里再次包装 env_func，这是解决问题的正确时机
+        rnn_env_func = env_func
+        env_func = lambda: TransformedEnv(rnn_env_func(), RemoveEmptySpecs())
+
+        # 步骤 6：定义并应用“后处理”转换（例如奖励求和）
+        transforms_env_post = self.task.get_env_transforms(test_env)
+        reward_sum_transform = Compose(
+            *[
+                RewardSum(
+                    in_keys=[(group, "reward")], 
+                    out_keys=[(group, "episode_reward")]
+                )
+                for group in self.group_map.keys()
+            ]
+        )
+        # 使用我们手动创建的 transform
+        transforms_training_post = transforms_env_post + [reward_sum_transform]
+        transforms_training_post = transforms_env_post + [
+            self.task.get_reward_sum_transform(test_env)
+        ]
+        transforms_env_post = Compose(*transforms_env_post)
+        transforms_training_post = Compose(*transforms_training_post)
+
+        # 将后处理转换应用到测试环境
+        self.test_env = TransformedEnv(test_env, transforms_env_post.clone()).to(
+            self.config.sampling_device # 测试环境可以在主进程中移到GPU
+        )
+
+        def reshaper(td: TensorDict) -> TensorDict:
+            """
+            一个稳健的 reshaper，用于将 [worker, seq, env] 变换为 [batch, seq]。
+            """
+            # 检查 TensorDict 的批处理维度数量
+            if td.ndim == 3:
+                # 这是 collector 运行时的主要情况: [worker=4, seq=1, env=128]
+                # 步骤 1: 置换维度，将 seq 维换到最后 -> [4, 128, 1]
+                td_permuted = td.permute(0, 2, 1)
+                # 步骤 2: 合并前两个维度 (worker 和 env) -> [512, 1]
+                return td_permuted.flatten(start_dim=0, end_dim=1)
+            
+            elif td.ndim == 2:
+                # 这是导致 IndexError 的情况: spec 计算时只有 [worker=4, env=128]
+                # 此时没有 seq 维度，我们直接合并这两个维度。
+                # [4, 128] -> [512]。后续的 RNN 变换会负责添加 seq 维度。
+                return td.flatten(start_dim=0, end_dim=-1)
+            
+            else:
+                # 对于其他维度数量，暂时不处理
+                return td
+        
+        batch_reshape_transform = BatchSizeTransform(reshape_fn=reshaper)
+
+        # 步骤 7：构建最终用于采集器（Collector）的 `env_func`
+        # 它将负责在子进程中创建并配置好环境
+        env_class = (
+            SerialEnv if not self.config.parallel_collection else ParallelEnv
+        )
+        self.env_func = lambda: OuterPatchedTransformedEnv(
+            # env_func 会在子进程中被调用，创建出已修复规格的CPU环境
+            # 然后 ParallelEnv 会负责将其移至GPU（由Collector的device参数控制）
+            env_class(self.config.n_workers, env_func),
+            transforms_training_post.clone(),
+        )
+        # 将我们的 reshape 变换应用在最外层
+        original_env_func = self.env_func
+        self.env_func = lambda: original_env_func().append_transform(batch_reshape_transform.clone())
 
     def _setup_algorithm(self):
         self.algorithm = self.algorithm_config.get_algorithm(experiment=self)
@@ -733,13 +976,14 @@ class Experiment(CallbackNotifier):
                         )
                     ):
                         training_tds.append(self._optimizer_loop(group))
-                training_td = torch.stack(training_tds)
-                self.logger.log_training(
-                    group, training_td, step=self.n_iters_performed
-                )
+                if training_tds:
+                    training_td = torch.stack(training_tds)
+                    self.logger.log_training(
+                        group, training_td, step=self.n_iters_performed
+                    )
 
                 # Callback
-                self._on_train_end(training_td, group)
+                self._on_train_end(training_td if training_tds else None, group)
 
                 # Exploration update
                 if isinstance(self.group_policies[group], TensorDictSequential):
@@ -765,7 +1009,41 @@ class Experiment(CallbackNotifier):
                 )
                 and (len(self.config.loggers) or self.config.create_json)
             ):
-                self._evaluation_loop()
+                if self.evaluation_process is not None and self.evaluation_process.is_alive():
+                    warnings.warn(
+                        "Previous evaluation is still running. Skipping this one."
+                    )
+                else:
+                    print("\nStarting evaluation in a background process...")
+                    # Move policy to CPU and get state_dict to avoid pickling CUDA tensors
+                    policy_state_dict = self.policy.to("cpu").state_dict()
+                    
+                    # Prepare all necessary arguments for the top-level function.
+                    # All arguments must be pickle-able.
+                    args = (
+                        self.config,
+                        self.algorithm_config,
+                        self.model_config,
+                        self.critic_model_config,
+                        self.task,
+                        self.group_map,
+                        self.seed,
+                        self.continuous_actions,
+                        policy_state_dict,
+                        self.total_frames,
+                        self.n_iters_performed,
+                        self.name,
+                        self.folder_name,
+                    )
+
+                    self.evaluation_process = multiprocessing.Process(
+                        target=_run_evaluation_process,
+                        args=args
+                    )
+                    self.evaluation_process.start()
+
+                    # Immediately move policy back to the training device for continued training
+                    self.policy.to(self.config.train_device)
 
             # End of step
             iteration_time = time.time() - iteration_start
@@ -797,6 +1075,12 @@ class Experiment(CallbackNotifier):
 
     def close(self):
         """Close the experiment."""
+        if self.evaluation_process is not None and self.evaluation_process.is_alive():
+            print("Waiting for the background evaluation process to finish...")
+            self.evaluation_process.join(timeout=30) # Wait for 30 seconds
+            if self.evaluation_process.is_alive():
+                print("Evaluation process did not finish in time, terminating.")
+                self.evaluation_process.terminate()
         if not self.config.collect_with_grad:
             self.collector.shutdown()
         else:
