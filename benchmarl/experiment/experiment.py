@@ -21,14 +21,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-from tensordict import TensorDict
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictSequential
-from torchrl.collectors import SyncDataCollector
+from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
 
 from torchrl.envs import ParallelEnv, SerialEnv, TransformedEnv
-from torchrl.envs.transforms import Compose, Transform, RemoveEmptySpecs, BatchSizeTransform, RewardSum
-from torchrl.data.tensor_specs import CompositeSpec
+from torchrl.envs.transforms import Compose
 from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
 from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
@@ -54,28 +52,6 @@ _has_hydra = importlib.util.find_spec("hydra") is not None
 if _has_hydra:
     from hydra.core.hydra_config import HydraConfig
 
-class OuterPatchedTransformedEnv(TransformedEnv):
-    """
-    一个专门用于包装 ParallelEnv 和处理批处理维度变换的 TransformedEnv 最终补丁。
-    它通过只调用其基础环境的公共接口（.reset() 和 .step()）来确保正确性。
-    """
-    def _reset(self, tensordict: TensorDictBase | None = None, **kwargs) -> TensorDictBase:
-        # 预处理输入
-        tensordict = self.transform._reset_env_preprocess(tensordict)
-        # 始终调用 base_env 的【公共 reset()】方法
-        tensordict_reset = self.base_env.reset(tensordict, **kwargs)
-        # 应用 transform 的 reset 逻辑
-        tensordict_reset = self.transform._reset(tensordict_reset.empty(), tensordict_reset)
-        return tensordict_reset
-
-    def _step(self, tensordict: TensorDictBase) -> TensorDictBase:
-        # 1. 对输入进行逆向变换
-        tensordict_in = self.transform.inv(tensordict)
-        # 2. 调用 base_env 的【公共 step()】方法
-        next_tensordict = self.base_env.step(tensordict_in)
-        # 3. 对返回结果应用正向变换
-        next_tensordict = self.transform._step(tensordict_in, next_tensordict)
-        return next_tensordict
 
 @dataclass
 class ExperimentConfig:
@@ -148,7 +124,6 @@ class ExperimentConfig:
     keep_checkpoints_num: Optional[int] = MISSING
 
     evaluation_device: str = "cpu" 
-    n_workers: int = 4
 
     def train_batch_size(self, on_policy: bool) -> int:
         """
@@ -639,109 +614,62 @@ class Experiment(CallbackNotifier):
             )
 
     def _setup_task(self):
-        # 步骤 1：在 CPU 上创建临时的测试环境，用于获取元数据
-        # 这是为了避免在主进程中初始化CUDA资源
         test_env = self.task.get_env_fun(
             num_envs=self.config.evaluation_episodes,
             continuous_actions=self.continuous_actions,
             seed=self.seed,
-            device="cpu",  # 关键修改：在CPU上创建
+            device=self.config.sampling_device,
         )()
-
-        # 步骤 2：立即从测试环境中获取所有元数据
-        # 确保在使用 group_map 等变量前就完成定义
-        self.observation_spec = self.task.observation_spec(test_env)
-        self.info_spec = self.task.info_spec(test_env)
-        self.state_spec = self.task.state_spec(test_env)
-        self.action_mask_spec = self.task.action_mask_spec(test_env)
-        self.action_spec = self.task.action_spec(test_env)
-        self.group_map = self.task.group_map(test_env)
-        self.train_group_map = copy.deepcopy(self.group_map)
-        self.max_steps = self.task.max_steps(test_env)
-
-        # 步骤 3：定义基础环境创建函数，同样确保在 CPU 上创建
-        # 这个函数将被序列化后发送到各个子进程
         env_func = self.task.get_env_fun(
             num_envs=self.config.n_envs_per_worker(self.on_policy),
             continuous_actions=self.continuous_actions,
             seed=self.seed,
-            device="cpu",  # 关键修改：在CPU上创建
+            device=self.config.sampling_device,
         )
 
-        # 步骤 4：应用RNN转换（这是可能产生空规格问题的步骤）
+        transforms_env = self.task.get_env_transforms(test_env)
+        transforms_training = transforms_env + [
+            self.task.get_reward_sum_transform(test_env)
+        ]
+        transforms_env = Compose(*transforms_env)
+        transforms_training = Compose(*transforms_training)
+
+        # Initialize test env
+        self.test_env = TransformedEnv(test_env, transforms_env.clone()).to(
+            self.config.sampling_device
+        )
+
+        self.observation_spec = self.task.observation_spec(self.test_env)
+        self.info_spec = self.task.info_spec(self.test_env)
+        self.state_spec = self.task.state_spec(self.test_env)
+        self.action_mask_spec = self.task.action_mask_spec(self.test_env)
+        self.action_spec = self.task.action_spec(self.test_env)
+        self.group_map = self.task.group_map(self.test_env)
+        self.train_group_map = copy.deepcopy(self.group_map)
+        self.max_steps = self.task.max_steps(self.test_env)
+
+        # Add rnn transforms here so they do not show in the benchmarl specs
         if self.model_config.is_rnn:
-            test_env = _add_rnn_transforms(
-                lambda: test_env, self.group_map, self.model_config
+            self.test_env = _add_rnn_transforms(
+                lambda: self.test_env, self.group_map, self.model_config
             )()
             env_func = _add_rnn_transforms(env_func, self.group_map, self.model_config)
 
-        # 步骤 5：【核心修正】在RNN转换之后，清理它可能产生的任何空规格
-        # 我们在这里再次包装 env_func，这是解决问题的正确时机
-        rnn_env_func = env_func
-        env_func = lambda: TransformedEnv(rnn_env_func(), RemoveEmptySpecs())
-
-        # 步骤 6：定义并应用“后处理”转换（例如奖励求和）
-        transforms_env_post = self.task.get_env_transforms(test_env)
-        reward_sum_transform = Compose(
-            *[
-                RewardSum(
-                    in_keys=[(group, "reward")], 
-                    out_keys=[(group, "episode_reward")]
-                )
-                for group in self.group_map.keys()
-            ]
-        )
-        # 使用我们手动创建的 transform
-        transforms_training_post = transforms_env_post + [reward_sum_transform]
-        transforms_training_post = transforms_env_post + [
-            self.task.get_reward_sum_transform(test_env)
-        ]
-        transforms_env_post = Compose(*transforms_env_post)
-        transforms_training_post = Compose(*transforms_training_post)
-
-        # 将后处理转换应用到测试环境
-        self.test_env = TransformedEnv(test_env, transforms_env_post.clone()).to(
-            self.config.sampling_device # 测试环境可以在主进程中移到GPU
-        )
-
-        def reshaper(td: TensorDict) -> TensorDict:
-            """
-            一个稳健的 reshaper，用于将 [worker, seq, env] 变换为 [batch, seq]。
-            """
-            # 检查 TensorDict 的批处理维度数量
-            if td.ndim == 3:
-                # 这是 collector 运行时的主要情况: [worker=4, seq=1, env=128]
-                # 步骤 1: 置换维度，将 seq 维换到最后 -> [4, 128, 1]
-                td_permuted = td.permute(0, 2, 1)
-                # 步骤 2: 合并前两个维度 (worker 和 env) -> [512, 1]
-                return td_permuted.flatten(start_dim=0, end_dim=1)
-            
-            elif td.ndim == 2:
-                # 这是导致 IndexError 的情况: spec 计算时只有 [worker=4, env=128]
-                # 此时没有 seq 维度，我们直接合并这两个维度。
-                # [4, 128] -> [512]。后续的 RNN 变换会负责添加 seq 维度。
-                return td.flatten(start_dim=0, end_dim=-1)
-            
-            else:
-                # 对于其他维度数量，暂时不处理
-                return td
-        
-        batch_reshape_transform = BatchSizeTransform(reshape_fn=reshaper)
-
-        # 步骤 7：构建最终用于采集器（Collector）的 `env_func`
-        # 它将负责在子进程中创建并配置好环境
-        env_class = (
-            SerialEnv if not self.config.parallel_collection else ParallelEnv
-        )
-        self.env_func = lambda: OuterPatchedTransformedEnv(
-            # env_func 会在子进程中被调用，创建出已修复规格的CPU环境
-            # 然后 ParallelEnv 会负责将其移至GPU（由Collector的device参数控制）
-            env_class(self.config.n_workers, env_func),
-            transforms_training_post.clone(),
-        )
-        # 将我们的 reshape 变换应用在最外层
-        original_env_func = self.env_func
-        self.env_func = lambda: original_env_func().append_transform(batch_reshape_transform.clone())
+        # Initialize train env
+        if self.test_env.batch_size == ():
+            # If the environment is not vectorized, we simulate vectorization using parallel or serial environments
+            env_class = (
+                SerialEnv if not self.config.parallel_collection else ParallelEnv
+            )
+            self.env_func = lambda: TransformedEnv(
+                env_class(self.config.n_envs_per_worker(self.on_policy), env_func),
+                transforms_training.clone(),
+            )
+        else:
+            # Otherwise it is already vectorized
+            self.env_func = lambda: TransformedEnv(
+                env_func(), transforms_training.clone()
+            )
 
     def _setup_algorithm(self):
         self.algorithm = self.algorithm_config.get_algorithm(experiment=self)
@@ -773,6 +701,13 @@ class Experiment(CallbackNotifier):
             }
             for group in self.group_map.keys()
         }
+        if "cuda" in self.config.train_device:
+            self.cuda_streams = {
+                group: torch.cuda.Stream(device=self.config.train_device)
+                for group in self.group_map.keys()
+            }
+        else:
+            self.cuda_streams = None
 
     def _setup_collector(self):
         self.policy = self.algorithm.get_policy_for_collection()
@@ -797,6 +732,7 @@ class Experiment(CallbackNotifier):
                     else 0
                 ),
             )
+            self.collector.set_seed(self.seed)
         else:
             if self.config.off_policy_init_random_frames and not self.on_policy:
                 raise TypeError(
@@ -942,6 +878,7 @@ class Experiment(CallbackNotifier):
 
             # Logging collection
             collection_time = time.time() - iteration_start
+            print(f"collection time: {collection_time}")
             current_frames = batch.numel()
             self.total_frames += current_frames
             self.mean_return = self.logger.log_collection(
@@ -958,39 +895,69 @@ class Experiment(CallbackNotifier):
 
             # Loop over groups
             training_start = time.time()
+            
+            # --- STAGE 1: Asynchronously dispatch all group tasks ---
+            all_groups_training_tds = {group: [] for group in self.train_group_map.keys()}
+
             for group in self.train_group_map.keys():
-                group_batch = batch.exclude(*self._get_excluded_keys(group))
-                group_batch = self.algorithm.process_batch(group, group_batch)
-                if not self.algorithm.has_rnn:
-                    group_batch = group_batch.reshape(-1)
+                
+                def train_group():
+                    # Prepare data for the current group
+                    group_batch = batch.exclude(*self._get_excluded_keys(group))
+                    group_batch = self.algorithm.process_batch(group, group_batch)
+                    if not self.algorithm.has_rnn:
+                        group_batch = group_batch.reshape(-1)
 
-                group_buffer = self.replay_buffers[group]
-                group_buffer.extend(group_batch.to(group_buffer.storage.device))
+                    group_buffer = self.replay_buffers[group]
+                    # .to() is non-blocking when in a stream context for a different device
+                    group_buffer.extend(group_batch.to(group_buffer.storage.device, non_blocking=True))
 
-                training_tds = []
-                for _ in range(self.config.n_optimizer_steps(self.on_policy)):
-                    for _ in range(
-                        -(
-                            -self.config.train_batch_size(self.on_policy)
-                            // self.config.train_minibatch_size(self.on_policy)
-                        )
-                    ):
-                        training_tds.append(self._optimizer_loop(group))
+                    # Perform training steps for the group
+                    num_optimizer_steps = self.config.n_optimizer_steps(self.on_policy)
+                    num_minibatches = -(
+                        -self.config.train_batch_size(self.on_policy)
+                        // self.config.train_minibatch_size(self.on_policy)
+                    )
+                    
+                    for _ in range(num_optimizer_steps):
+                        for _ in range(num_minibatches):
+                            # All CUDA operations inside _optimizer_loop will be on this stream
+                            training_td = self._optimizer_loop(group)
+                            all_groups_training_tds[group].append(training_td)
+                
+                # If using CUDA, run inside the group's specific stream
+                if self.cuda_streams:
+                    with torch.cuda.stream(self.cuda_streams[group]):
+                        train_group()
+                else: # Fallback for CPU training
+                    train_group()
+
+            # --- STAGE 2: Synchronize all streams ---
+            if self.cuda_streams:
+                # This is a blocking call that waits for all previously queued work
+                # in all streams on the current device to finish.
+                torch.cuda.synchronize(device=self.config.train_device)
+
+            # --- STAGE 3: Process results (Logging and Callbacks) ---
+            # Now that all computations are done, we can safely access the results.
+            for group in self.train_group_map.keys():
+                training_tds = all_groups_training_tds[group]
                 if training_tds:
+                    # Stack results and log them
                     training_td = torch.stack(training_tds)
                     self.logger.log_training(
                         group, training_td, step=self.n_iters_performed
                     )
-
-                # Callback
+                
+                # Callback after all training for a group is done
                 self._on_train_end(training_td if training_tds else None, group)
 
-                # Exploration update
+                # Update exploration annealing (this part is fast, can remain serial)
                 if isinstance(self.group_policies[group], TensorDictSequential):
                     explore_layer = self.group_policies[group][-1]
                 else:
                     explore_layer = self.group_policies[group]
-                if hasattr(explore_layer, "step"):  # Step exploration annealing
+                if hasattr(explore_layer, "step"):
                     explore_layer.step(current_frames)
 
             # Update policy in collector
@@ -1027,7 +994,7 @@ class Experiment(CallbackNotifier):
                         self.critic_model_config,
                         self.task,
                         self.group_map,
-                        self.seed,
+                        self.seed + self.n_iters_performed,
                         self.continuous_actions,
                         policy_state_dict,
                         self.total_frames,

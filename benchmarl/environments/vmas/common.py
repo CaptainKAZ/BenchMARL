@@ -12,7 +12,7 @@ from torchrl.envs.libs.vmas import VmasEnv
 
 from benchmarl.environments.common import Task, TaskClass
 from benchmarl.utils import DEVICE_TYPING
-
+import traceback
 
 class VmasClass(TaskClass):
     def get_env_fun(
@@ -113,6 +113,7 @@ class VmasTask(Task):
     SIMPLE_SPREAD = None
     SIMPLE_TAG = None
     SIMPLE_WORLD_COMM = None
+    LAYUP = None
 
     @staticmethod
     def associated_class():
