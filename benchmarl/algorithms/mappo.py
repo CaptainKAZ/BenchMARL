@@ -57,6 +57,7 @@ class Mappo(Algorithm):
         scale_mapping: str,
         use_tanh_normal: bool,
         minibatch_advantage: bool,
+        share_param_actor: bool,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -70,6 +71,7 @@ class Mappo(Algorithm):
         self.scale_mapping = scale_mapping
         self.use_tanh_normal = use_tanh_normal
         self.minibatch_advantage = minibatch_advantage
+        self.share_param_actor = share_param_actor
 
     #############################
     # Overridden abstract methods
@@ -141,7 +143,7 @@ class Mappo(Algorithm):
             input_has_agent_dim=True,
             n_agents=n_agents,
             centralised=False,
-            share_params=self.experiment_config.share_policy_params,
+            share_params=self.share_param_actor,
             device=self.device,
             action_spec=self.action_spec,
         )
@@ -332,6 +334,7 @@ class MappoConfig(AlgorithmConfig):
     scale_mapping: str = MISSING
     use_tanh_normal: bool = MISSING
     minibatch_advantage: bool = MISSING
+    share_param_actor: bool = MISSING
 
     @staticmethod
     def associated_class() -> Type[Algorithm]:

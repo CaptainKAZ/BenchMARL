@@ -3,15 +3,15 @@ defaults:
   - _self_
 
 # The device for collection (e.g. cuda)
-sampling_device: "cpu"
+sampling_device: "cuda"
 # The device for training (e.g. cuda)
-train_device: "cpu"
+train_device: "cuda"
 # The device for the replay buffer of off-policy algorithms (e.g. cuda).
 # Use "disk" to store it on disk (in the experiment save_folder)
-buffer_device: "cpu"
+buffer_device: "cuda"
 
 # Whether to share the parameters of the policy within agent groups
-share_policy_params: True
+share_policy_params: False
 # If an algorithm and an env support both continuous and discrete actions, what should be preferred
 prefer_continuous_actions: True
 # If False collection is done using a collector (under no grad). If True, collection is done with gradients.
@@ -21,7 +21,7 @@ collect_with_grad: False
 parallel_collection: False
 
 # Discount factor
-gamma: 0.99
+gamma: 0.995
 # Learning rate
 lr: 0.00005
 # The epsilon parameter of the adam optimizer
@@ -41,40 +41,40 @@ hard_target_update_frequency: 5
 # When an exploration wrapper is used. This is its initial epsilon for annealing
 exploration_eps_init: 0.8
 # When an exploration wrapper is used. This is its final epsilon after annealing
-exploration_eps_end: 0.01
+exploration_eps_end: 0.05
 # Number of frames for annealing of exploration strategy in deterministic policy algorithms
 # If null it will default to max_n_frames / 3
 exploration_anneal_frames: null
 
 # The maximum number of experiment iterations before the experiment terminates, exclusive with max_n_frames
-max_n_iters: null
+max_n_iters: 4000
 # Number of collected frames before ending, exclusive with max_n_iters
-max_n_frames: 3_000_000
+max_n_frames: null
 
 # Number of frames collected and each experiment iteration
-on_policy_collected_frames_per_batch: 6000
+on_policy_collected_frames_per_batch: 102400
 # Number of environments used for collection
 # If the environment is vectorized, this will be the number of batched environments.
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
-on_policy_n_envs_per_worker: 10
+on_policy_n_envs_per_worker: 2048
 # This is the number of times collected_frames_per_batch will be split into minibatches and trained
 on_policy_n_minibatch_iters: 45
 # In on-policy algorithms the train_batch_size will be equal to the on_policy_collected_frames_per_batch
 # and it will be split into minibatches with this number of frames for training
-on_policy_minibatch_size: 400
+on_policy_minibatch_size: 102400
 
 # Number of frames collected and each experiment iteration
-off_policy_collected_frames_per_batch: 6000
+off_policy_collected_frames_per_batch: 51200
 # Number of environments used for collection
 # If the environment is vectorized, this will be the number of batched environments.
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
-off_policy_n_envs_per_worker: 10
+off_policy_n_envs_per_worker: 256
 # This is the number of times off_policy_train_batch_size will be sampled from the buffer and trained over.
 off_policy_n_optimizer_steps: 1000
 # Number of frames used for each off_policy_n_optimizer_steps when training off-policy algorithms
 off_policy_train_batch_size: 128
 # Maximum number of frames to keep in replay buffer memory for off-policy algorithms
-off_policy_memory_size: 1_000_000
+off_policy_memory_size: 10240000
 # Number of random action frames to prefill the replay buffer with
 off_policy_init_random_frames: 0
 # whether to use priorities while sampling from the replay buffer
@@ -90,9 +90,9 @@ evaluation: True
 # Whether to render the evaluation (if rendering is available)
 render: True
 # Frequency of evaluation in terms of collected frames (this should be a multiple of on/off_policy_collected_frames_per_batch)
-evaluation_interval: 120_000
+evaluation_interval: 2457600
 # Number of episodes that evaluation is run on
-evaluation_episodes: 10
+evaluation_episodes: 16
 # If True, when stochastic policies are evaluated, their deterministic value is taken, otherwise, if False, they are sampled
 evaluation_deterministic_actions: True
 # If True, seed the environment before evaluation leading to always the same evaluation env being used
@@ -100,7 +100,7 @@ evaluation_deterministic_actions: True
 evaluation_static: False
 
 # List of loggers to use, options are: wandb, csv, tensorboard, mflow
-loggers: [csv,wandb]
+loggers: [csv,tensorboard]
 # Wandb project name (kept for backward compatibility)
 project_name: "benchmarl"
 # Wandb extra kwargs passed to the WandbLogger (~superset of wandb.init kwargs)
@@ -122,9 +122,9 @@ restore_file: null
 restore_map_location: null
 # Interval for experiment saving in terms of collected frames (this should be a multiple of on/off_policy_collected_frames_per_batch).
 # Set it to 0 to disable checkpointing
-checkpoint_interval: 0
+checkpoint_interval: 2457600
 # Whether to checkpoint when the experiment is done
-checkpoint_at_end: False
+checkpoint_at_end: True
 # How many checkpoints to keep. As new checkpoints are taken, temporally older checkpoints are deleted to keep this number of
 # checkpoints. The checkpoint at the end is included in this number. Set to `null` to keep all checkpoints.
-keep_checkpoints_num: 3
+keep_checkpoints_num: 10

@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictSequential
-from torchrl.collectors import SyncDataCollector
+from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
 
 from torchrl.envs import ParallelEnv, SerialEnv, TransformedEnv
 from torchrl.envs.transforms import Compose
@@ -45,6 +45,8 @@ from benchmarl.utils import (
     local_seed,
     seed_everything,
 )
+import multiprocessing
+from torch.profiler import profile, record_function, ProfilerActivity
 
 _has_hydra = importlib.util.find_spec("hydra") is not None
 if _has_hydra:
@@ -120,6 +122,8 @@ class ExperimentConfig:
     checkpoint_interval: int = MISSING
     checkpoint_at_end: bool = MISSING
     keep_checkpoints_num: Optional[int] = MISSING
+
+    evaluation_device: str = "cpu" 
 
     def train_batch_size(self, on_policy: bool) -> int:
         """
@@ -314,6 +318,169 @@ class ExperimentConfig:
             )
 
 
+def _run_evaluation_process(
+    experiment_config: ExperimentConfig,
+    algorithm_config: AlgorithmConfig,
+    model_config: ModelConfig,
+    critic_model_config: ModelConfig,
+    task: Task,
+    group_map: Dict,
+    seed: int,
+    continuous_actions: bool,
+    policy_state_dict: Dict,
+    total_frames: int,
+    n_iters_performed: int,
+    experiment_name: str,
+    folder_name: Path,
+):
+    """
+    This function is designed to be run in a separate process for evaluation.
+    It rebuilds all necessary components on the specified evaluation device.
+    """
+    # ====================================================================
+    # 1. SETUP: Set device and seed for this independent process
+    # ====================================================================
+    eval_device = experiment_config.evaluation_device
+    seed_everything(seed)
+    print(f"[Eval Process]: Starting evaluation on device '{eval_device}'.")
+
+    # ====================================================================
+    # 2. REBUILD ENVIRONMENT AND GET SPECS *FIRST*
+    # ====================================================================
+    # We must create the environment first to get its specifications.
+    test_env = task.get_env_fun(
+        num_envs=experiment_config.evaluation_episodes,
+        continuous_actions=continuous_actions,
+        seed=seed,
+        device=eval_device,
+    )()
+    
+    # Get all specs from the created environment
+    observation_spec = task.observation_spec(test_env)
+    action_spec = task.action_spec(test_env)
+    info_spec = task.info_spec(test_env)
+    state_spec = task.state_spec(test_env)
+    action_mask_spec = task.action_mask_spec(test_env)
+
+    # ====================================================================
+    # 3. REBUILD ALGORITHM and OTHER COMPONENTS
+    # ====================================================================
+
+    # Now, create a more complete shell that includes the specs
+    class ExperimentShell:
+        def __init__(self):
+            self.config = experiment_config
+            self.algorithm_config = algorithm_config
+            self.model_config = model_config
+            self.critic_model_config = critic_model_config
+            self.task = task
+            self.group_map = group_map
+            self.continuous_actions = continuous_actions
+            self.seed = seed
+            self.on_policy = self.algorithm_config.on_policy()
+
+            # Pass the retrieved specs
+            self.observation_spec = observation_spec
+            self.action_spec = action_spec
+            self.info_spec = info_spec
+            self.state_spec = state_spec
+            self.action_mask_spec = action_mask_spec
+
+    exp_shell = ExperimentShell()
+    algorithm = algorithm_config.get_algorithm(exp_shell)
+
+    # Now that the algorithm is created, we can finish setting up the env
+    transforms_env = Compose(*task.get_env_transforms(test_env))
+    test_env = TransformedEnv(test_env, transforms_env.clone()).to(eval_device)
+    if model_config.is_rnn:
+        test_env = _add_rnn_transforms(lambda: test_env, group_map, model_config)()
+    test_env = algorithm.process_env_fun(lambda: test_env)()
+
+    if experiment_config.evaluation_static:
+        try:
+            test_env.set_seed(seed)
+        except NotImplementedError:
+            warnings.warn(
+                "`experiment.evaluation_static` set to true but the environment does not allow to set seeds."
+            )
+
+    # Rebuild the policy on the correct device and load its weights
+    eval_policy = algorithm.get_policy_for_collection()
+    eval_policy.to(eval_device)
+    eval_policy.load_state_dict(policy_state_dict)
+    eval_policy.eval()
+
+    # Rebuild a logger instance
+    logger = Logger(
+        experiment_name=experiment_name,
+        folder_name=str(folder_name),
+        experiment_config=experiment_config,
+        algorithm_name=algorithm_config.associated_class().__name__.lower(),
+        model_name=model_config.associated_class().__name__.lower(),
+        environment_name=task.env_name().lower(),
+        task_name=task.name.lower(),
+        group_map=group_map,
+        seed=seed,
+        project_name=experiment_config.project_name,
+        wandb_extra_kwargs=experiment_config.wandb_extra_kwargs,
+    )
+
+    # ====================================================================
+    # 4. RUN ROLLOUTS: Perform the evaluation
+    # ====================================================================
+    evaluation_start = time.time()
+    with set_exploration_type(
+        ExplorationType.DETERMINISTIC
+        if experiment_config.evaluation_deterministic_actions
+        else ExplorationType.RANDOM
+    ):
+        if task.has_render(test_env) and experiment_config.render:
+            video_frames = []
+            def callback(env, td):
+                video_frames.append(task.__class__.render_callback(exp_shell, env, td))
+        else:
+            video_frames = None
+            callback = None
+
+        if test_env.batch_size == ():
+            rollouts = []
+            for eval_episode in range(experiment_config.evaluation_episodes):
+                rollouts.append(
+                    test_env.rollout(
+                        max_steps=task.max_steps(test_env),
+                        policy=eval_policy,
+                        callback=callback if eval_episode == 0 else None,
+                        auto_cast_to_device=True,
+                        break_when_any_done=True,
+                    )
+                )
+        else:
+            rollouts = test_env.rollout(
+                max_steps=task.max_steps(test_env),
+                policy=eval_policy,
+                callback=callback,
+                auto_cast_to_device=True,
+                break_when_any_done=False,
+            )
+            rollouts = list(rollouts.unbind(0))
+
+    # ====================================================================
+    # 5. LOG & CLEANUP: Report results and close resources
+    # ====================================================================
+    test_env.close()
+
+    evaluation_time = time.time() - evaluation_start
+    logger.log({"timers/evaluation_time": evaluation_time}, step=n_iters_performed)
+    logger.log_evaluation(
+        rollouts,
+        video_frames=video_frames,
+        step=n_iters_performed,
+        total_frames=total_frames,
+    )
+    logger.commit()
+    logger.finish()
+    print(f"\n[Eval Process]: Evaluation for iteration {n_iters_performed} complete. Results logged.")
+
 class Experiment(CallbackNotifier):
     """
     Main experiment class in BenchMARL.
@@ -342,6 +509,8 @@ class Experiment(CallbackNotifier):
         critic_model_config: Optional[ModelConfig] = None,
         callbacks: Optional[List[Callback]] = None,
     ):
+
+        multiprocessing.set_start_method("spawn", force=True)
         super().__init__(
             experiment=self, callbacks=callbacks if callbacks is not None else []
         )
@@ -372,6 +541,8 @@ class Experiment(CallbackNotifier):
         self.total_frames = 0
         self.n_iters_performed = 0
         self.mean_return = 0
+
+        self.evaluation_process: Optional[multiprocessing.Process] = None
 
         if self.config.restore_file is not None:
             self._load_experiment()
@@ -530,6 +701,13 @@ class Experiment(CallbackNotifier):
             }
             for group in self.group_map.keys()
         }
+        if "cuda" in self.config.train_device:
+            self.cuda_streams = {
+                group: torch.cuda.Stream(device=self.config.train_device)
+                for group in self.group_map.keys()
+            }
+        else:
+            self.cuda_streams = None
 
     def _setup_collector(self):
         self.policy = self.algorithm.get_policy_for_collection()
@@ -554,6 +732,7 @@ class Experiment(CallbackNotifier):
                     else 0
                 ),
             )
+            self.collector.set_seed(self.seed)
         else:
             if self.config.off_policy_init_random_frames and not self.on_policy:
                 raise TypeError(
@@ -699,6 +878,7 @@ class Experiment(CallbackNotifier):
 
             # Logging collection
             collection_time = time.time() - iteration_start
+            print(f"collection time: {collection_time}")
             current_frames = batch.numel()
             self.total_frames += current_frames
             self.mean_return = self.logger.log_collection(
@@ -715,38 +895,69 @@ class Experiment(CallbackNotifier):
 
             # Loop over groups
             training_start = time.time()
+            
+            # --- STAGE 1: Asynchronously dispatch all group tasks ---
+            all_groups_training_tds = {group: [] for group in self.train_group_map.keys()}
+
             for group in self.train_group_map.keys():
-                group_batch = batch.exclude(*self._get_excluded_keys(group))
-                group_batch = self.algorithm.process_batch(group, group_batch)
-                if not self.algorithm.has_rnn:
-                    group_batch = group_batch.reshape(-1)
+                
+                def train_group():
+                    # Prepare data for the current group
+                    group_batch = batch.exclude(*self._get_excluded_keys(group))
+                    group_batch = self.algorithm.process_batch(group, group_batch)
+                    if not self.algorithm.has_rnn:
+                        group_batch = group_batch.reshape(-1)
 
-                group_buffer = self.replay_buffers[group]
-                group_buffer.extend(group_batch.to(group_buffer.storage.device))
+                    group_buffer = self.replay_buffers[group]
+                    # .to() is non-blocking when in a stream context for a different device
+                    group_buffer.extend(group_batch.to(group_buffer.storage.device, non_blocking=True))
 
-                training_tds = []
-                for _ in range(self.config.n_optimizer_steps(self.on_policy)):
-                    for _ in range(
-                        -(
-                            -self.config.train_batch_size(self.on_policy)
-                            // self.config.train_minibatch_size(self.on_policy)
-                        )
-                    ):
-                        training_tds.append(self._optimizer_loop(group))
-                training_td = torch.stack(training_tds)
-                self.logger.log_training(
-                    group, training_td, step=self.n_iters_performed
-                )
+                    # Perform training steps for the group
+                    num_optimizer_steps = self.config.n_optimizer_steps(self.on_policy)
+                    num_minibatches = -(
+                        -self.config.train_batch_size(self.on_policy)
+                        // self.config.train_minibatch_size(self.on_policy)
+                    )
+                    
+                    for _ in range(num_optimizer_steps):
+                        for _ in range(num_minibatches):
+                            # All CUDA operations inside _optimizer_loop will be on this stream
+                            training_td = self._optimizer_loop(group)
+                            all_groups_training_tds[group].append(training_td)
+                
+                # If using CUDA, run inside the group's specific stream
+                if self.cuda_streams:
+                    with torch.cuda.stream(self.cuda_streams[group]):
+                        train_group()
+                else: # Fallback for CPU training
+                    train_group()
 
-                # Callback
-                self._on_train_end(training_td, group)
+            # --- STAGE 2: Synchronize all streams ---
+            if self.cuda_streams:
+                # This is a blocking call that waits for all previously queued work
+                # in all streams on the current device to finish.
+                torch.cuda.synchronize(device=self.config.train_device)
 
-                # Exploration update
+            # --- STAGE 3: Process results (Logging and Callbacks) ---
+            # Now that all computations are done, we can safely access the results.
+            for group in self.train_group_map.keys():
+                training_tds = all_groups_training_tds[group]
+                if training_tds:
+                    # Stack results and log them
+                    training_td = torch.stack(training_tds)
+                    self.logger.log_training(
+                        group, training_td, step=self.n_iters_performed
+                    )
+                
+                # Callback after all training for a group is done
+                self._on_train_end(training_td if training_tds else None, group)
+
+                # Update exploration annealing (this part is fast, can remain serial)
                 if isinstance(self.group_policies[group], TensorDictSequential):
                     explore_layer = self.group_policies[group][-1]
                 else:
                     explore_layer = self.group_policies[group]
-                if hasattr(explore_layer, "step"):  # Step exploration annealing
+                if hasattr(explore_layer, "step"):
                     explore_layer.step(current_frames)
 
             # Update policy in collector
@@ -765,7 +976,41 @@ class Experiment(CallbackNotifier):
                 )
                 and (len(self.config.loggers) or self.config.create_json)
             ):
-                self._evaluation_loop()
+                if self.evaluation_process is not None and self.evaluation_process.is_alive():
+                    warnings.warn(
+                        "Previous evaluation is still running. Skipping this one."
+                    )
+                else:
+                    print("\nStarting evaluation in a background process...")
+                    # Move policy to CPU and get state_dict to avoid pickling CUDA tensors
+                    policy_state_dict = self.policy.to("cpu").state_dict()
+                    
+                    # Prepare all necessary arguments for the top-level function.
+                    # All arguments must be pickle-able.
+                    args = (
+                        self.config,
+                        self.algorithm_config,
+                        self.model_config,
+                        self.critic_model_config,
+                        self.task,
+                        self.group_map,
+                        self.seed + self.n_iters_performed,
+                        self.continuous_actions,
+                        policy_state_dict,
+                        self.total_frames,
+                        self.n_iters_performed,
+                        self.name,
+                        self.folder_name,
+                    )
+
+                    self.evaluation_process = multiprocessing.Process(
+                        target=_run_evaluation_process,
+                        args=args
+                    )
+                    self.evaluation_process.start()
+
+                    # Immediately move policy back to the training device for continued training
+                    self.policy.to(self.config.train_device)
 
             # End of step
             iteration_time = time.time() - iteration_start
@@ -797,6 +1042,12 @@ class Experiment(CallbackNotifier):
 
     def close(self):
         """Close the experiment."""
+        if self.evaluation_process is not None and self.evaluation_process.is_alive():
+            print("Waiting for the background evaluation process to finish...")
+            self.evaluation_process.join(timeout=30) # Wait for 30 seconds
+            if self.evaluation_process.is_alive():
+                print("Evaluation process did not finish in time, terminating.")
+                self.evaluation_process.terminate()
         if not self.config.collect_with_grad:
             self.collector.shutdown()
         else:
