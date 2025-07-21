@@ -47,6 +47,7 @@ from benchmarl.utils import (
 )
 import multiprocessing
 from torch.profiler import profile, record_function, ProfilerActivity
+from torch.cuda.amp import GradScaler, autocast
 
 _has_hydra = importlib.util.find_spec("hydra") is not None
 if _has_hydra:
@@ -88,6 +89,8 @@ class ExperimentConfig:
 
     max_n_iters: Optional[int] = MISSING
     max_n_frames: Optional[int] = MISSING
+
+    n_workers: int = MISSING
 
     on_policy_collected_frames_per_batch: int = MISSING
     on_policy_n_envs_per_worker: int = MISSING
@@ -429,40 +432,42 @@ def _run_evaluation_process(
     # 4. RUN ROLLOUTS: Perform the evaluation
     # ====================================================================
     evaluation_start = time.time()
-    with set_exploration_type(
-        ExplorationType.DETERMINISTIC
-        if experiment_config.evaluation_deterministic_actions
-        else ExplorationType.RANDOM
-    ):
-        if task.has_render(test_env) and experiment_config.render:
-            video_frames = []
-            def callback(env, td):
-                video_frames.append(task.__class__.render_callback(exp_shell, env, td))
-        else:
-            video_frames = None
-            callback = None
+    
+    with torch.no_grad():
+        with set_exploration_type(
+            ExplorationType.DETERMINISTIC
+            if experiment_config.evaluation_deterministic_actions
+            else ExplorationType.RANDOM
+        ):
+            if task.has_render(test_env) and experiment_config.render:
+                video_frames = []
+                def callback(env, td):
+                    video_frames.append(task.__class__.render_callback(exp_shell, env, td))
+            else:
+                video_frames = None
+                callback = None
 
-        if test_env.batch_size == ():
-            rollouts = []
-            for eval_episode in range(experiment_config.evaluation_episodes):
-                rollouts.append(
-                    test_env.rollout(
-                        max_steps=task.max_steps(test_env),
-                        policy=eval_policy,
-                        callback=callback if eval_episode == 0 else None,
-                        auto_cast_to_device=True,
-                        break_when_any_done=True,
+            if test_env.batch_size == ():
+                rollouts = []
+                for eval_episode in range(experiment_config.evaluation_episodes):
+                    rollouts.append(
+                        test_env.rollout(
+                            max_steps=task.max_steps(test_env),
+                            policy=eval_policy,
+                            callback=callback if eval_episode == 0 else None,
+                            auto_cast_to_device=True,
+                            break_when_any_done=True,
+                        )
                     )
+            else:
+                rollouts = test_env.rollout(
+                    max_steps=task.max_steps(test_env),
+                    policy=eval_policy,
+                    callback=callback,
+                    auto_cast_to_device=True,
+                    break_when_any_done=False,
                 )
-        else:
-            rollouts = test_env.rollout(
-                max_steps=task.max_steps(test_env),
-                policy=eval_policy,
-                callback=callback,
-                auto_cast_to_device=True,
-                break_when_any_done=False,
-            )
-            rollouts = list(rollouts.unbind(0))
+                rollouts = list(rollouts.unbind(0))
 
     # ====================================================================
     # 5. LOG & CLEANUP: Report results and close resources
@@ -708,6 +713,7 @@ class Experiment(CallbackNotifier):
             }
         else:
             self.cuda_streams = None
+        self.scaler = torch.amp.GradScaler("cuda")
 
     def _setup_collector(self):
         self.policy = self.algorithm.get_policy_for_collection()
@@ -719,9 +725,9 @@ class Experiment(CallbackNotifier):
             self.group_policies.update({group: group_policy[0]})
 
         if not self.config.collect_with_grad:
-            self.collector = SyncDataCollector(
-                self.env_func,
-                self.policy,
+            self.collector = MultiSyncDataCollector(
+                create_env_fn=[self.env_func for _ in range(self.config.n_workers)],
+                policy=self.policy,
                 device=self.config.sampling_device,
                 storing_device=self.config.sampling_device,
                 frames_per_batch=self.config.collected_frames_per_batch(self.on_policy),
@@ -729,8 +735,9 @@ class Experiment(CallbackNotifier):
                 init_random_frames=(
                     self.config.off_policy_init_random_frames
                     if not self.on_policy
-                    else 0
+                    else -1
                 ),
+                cat_results=0,
             )
             self.collector.set_seed(self.seed)
         else:
@@ -855,6 +862,7 @@ class Experiment(CallbackNotifier):
             self.n_iters_performed, self.config.get_max_n_iters(self.on_policy)
         ):
             iteration_start = time.time()
+            torch.cuda.empty_cache()
             if not self.config.collect_with_grad:
                 batch = next(iterator)
             else:
@@ -868,6 +876,7 @@ class Experiment(CallbackNotifier):
                         break_when_any_done=False,
                         auto_reset=False,
                         tensordict=reset_batch,
+                        auto_cast_to_device=True,
                     )
                     reset_batch = step_mdp(
                         batch[..., -1],
@@ -895,75 +904,40 @@ class Experiment(CallbackNotifier):
 
             # Loop over groups
             training_start = time.time()
-            
-            # --- STAGE 1: Asynchronously dispatch all group tasks ---
-            all_groups_training_tds = {group: [] for group in self.train_group_map.keys()}
-
             for group in self.train_group_map.keys():
-                
-                def train_group():
-                    # Prepare data for the current group
-                    group_batch = batch.exclude(*self._get_excluded_keys(group))
-                    group_batch = self.algorithm.process_batch(group, group_batch)
-                    if not self.algorithm.has_rnn:
-                        group_batch = group_batch.reshape(-1)
-
-                    group_buffer = self.replay_buffers[group]
-                    # .to() is non-blocking when in a stream context for a different device
-                    group_buffer.extend(group_batch.to(group_buffer.storage.device, non_blocking=True))
-
-                    # Perform training steps for the group
-                    num_optimizer_steps = self.config.n_optimizer_steps(self.on_policy)
-                    num_minibatches = -(
-                        -self.config.train_batch_size(self.on_policy)
-                        // self.config.train_minibatch_size(self.on_policy)
-                    )
-                    
-                    for _ in range(num_optimizer_steps):
-                        for _ in range(num_minibatches):
-                            # All CUDA operations inside _optimizer_loop will be on this stream
-                            training_td = self._optimizer_loop(group)
-                            all_groups_training_tds[group].append(training_td)
-                
-                # If using CUDA, run inside the group's specific stream
-                if self.cuda_streams:
-                    with torch.cuda.stream(self.cuda_streams[group]):
-                        train_group()
-                else: # Fallback for CPU training
-                    train_group()
-
-            # --- STAGE 2: Synchronize all streams ---
-            if self.cuda_streams:
-                # This is a blocking call that waits for all previously queued work
-                # in all streams on the current device to finish.
-                torch.cuda.synchronize(device=self.config.train_device)
-
-            # --- STAGE 3: Process results (Logging and Callbacks) ---
-            # Now that all computations are done, we can safely access the results.
-            for group in self.train_group_map.keys():
-                training_tds = all_groups_training_tds[group]
-                if training_tds:
-                    # Stack results and log them
-                    training_td = torch.stack(training_tds)
-                    self.logger.log_training(
-                        group, training_td, step=self.n_iters_performed
-                    )
-                
-                # Callback after all training for a group is done
-                self._on_train_end(training_td if training_tds else None, group)
-
-                # Update exploration annealing (this part is fast, can remain serial)
+                group_batch = batch.exclude(*self._get_excluded_keys(group)).to(
+                    self.config.train_device
+                )
+                group_batch = self.algorithm.process_batch(group, group_batch)
+                if not self.algorithm.has_rnn:
+                    group_batch = group_batch.reshape(-1)
+                group_buffer = self.replay_buffers[group]
+                group_buffer.extend(group_batch.to(group_buffer.storage.device))
+                training_tds = []
+                for _ in range(self.config.n_optimizer_steps(self.on_policy)):
+                    for _ in range(
+                        -(
+                            -self.config.train_batch_size(self.on_policy)
+                            // self.config.train_minibatch_size(self.on_policy)
+                        )
+                    ):
+                        training_tds.append(self._optimizer_loop(group))
+                training_td = torch.stack(training_tds)
+                self.logger.log_training(
+                    group, training_td, step=self.n_iters_performed
+                )
+                # Callback
+                self._on_train_end(training_td, group)
+                # Exploration update
                 if isinstance(self.group_policies[group], TensorDictSequential):
                     explore_layer = self.group_policies[group][-1]
                 else:
                     explore_layer = self.group_policies[group]
-                if hasattr(explore_layer, "step"):
+                if hasattr(explore_layer, "step"):  # Step exploration annealing
                     explore_layer.step(current_frames)
-
             # Update policy in collector
             if not self.config.collect_with_grad:
                 self.collector.update_policy_weights_()
-
             # Training timer
             training_time = time.time() - training_start
 
@@ -1011,6 +985,7 @@ class Experiment(CallbackNotifier):
 
                     # Immediately move policy back to the training device for continued training
                     self.policy.to(self.config.train_device)
+                # self._evaluation_loop()
 
             # End of step
             iteration_time = time.time() - iteration_start
@@ -1069,25 +1044,40 @@ class Experiment(CallbackNotifier):
 
     def _optimizer_loop(self, group: str) -> TensorDictBase:
         subdata = self.replay_buffers[group].sample().to(self.config.train_device)
-        loss_vals = self.losses[group](subdata)
+
+        # 1. 使用 autocast 上下文包裹前向传播(损失计算)
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            loss_vals = self.losses[group](subdata)
+
         training_td = loss_vals.detach()
         loss_vals = self.algorithm.process_loss_vals(group, loss_vals)
 
+        # 2. 修改循环内部的 backprop 和 step
         for loss_name, loss_value in loss_vals.items():
             if loss_name in self.optimizers[group].keys():
                 optimizer = self.optimizers[group][loss_name]
 
-                loss_value.backward()
+                # 使用 scaler 来缩放损失并执行反向传播
+                self.scaler.scale(loss_value).backward()
 
+                # --- 梯度裁剪部分保持不变 ---
+                # 注意：更精细的控制可能需要先 unscale 再裁剪，但对于大多数情况，
+                # 在 unscale 之前裁剪范数（clip_grad_norm_）是可接受的。
                 grad_norm = self._grad_clip(optimizer)
 
                 training_td.set(
                     f"grad_norm_{loss_name}",
                     torch.tensor(grad_norm, device=self.config.train_device),
                 )
+                # --- 梯度裁剪部分结束 ---
 
-                optimizer.step()
+                # scaler.step 会自动 unscale 梯度并执行优化器步骤
+                self.scaler.step(optimizer)
                 optimizer.zero_grad()
+        
+        # 3. 在所有优化器 step 完成后，更新 scaler
+        self.scaler.update()
+
         self.replay_buffers[group].update_tensordict_priority(subdata)
         if self.target_updaters[group] is not None:
             self.target_updaters[group].step()

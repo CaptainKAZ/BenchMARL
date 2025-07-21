@@ -16,6 +16,7 @@ from benchmarl.models import EnsembleModelConfig
 from benchmarl.algorithms import EnsembleAlgorithmConfig
 from torch.profiler import profile, ProfilerActivity
 from collections import OrderedDict
+# from torch.cuda.amp import GradScaler, autocast
 
 def print_dict_paths(d, path=""):
     for key, value in d.items():
@@ -188,6 +189,11 @@ class WinRateCurriculum(Callback):
             # # 'done' 标志着一个回合的结束
             total_dones_in_batch = done_info.sum().item()
 
+            # # 课程学习，先学会进攻
+            # if "defender" in new_train_map:
+            #     del new_train_map["defender"]
+            # return
+
             # # 计算在所有结束的回合中，由投篮导致的比率
             # win_rate = total_shots_in_batch / total_dones_in_batch if total_dones_in_batch > 0 else 0.0
             print(f"Win rate: {win_rate:.2f}")
@@ -223,27 +229,27 @@ class WinRateCurriculum(Callback):
         self.experiment.train_group_map = new_train_map
 
 checkpoint_path = "outputs/2025-07-06_19-39-05/mappo_layup_gru__c217740f_25_07_06-19_39_05/checkpoints"
-checkpoint_pattern="outputs/**/checkpoints/*.pt"
+checkpoint_pattern="/root/autodl-tmp/**/checkpoints/*.pt"
 
 if __name__ == '__main__':
     # 1. 定义预训练模型的路径
     # restore_file_path = find_latest_file(checkpoint_path,"*.pt")
-    # restore_file_path = find_latest_checkpoint(checkpoint_pattern)
-    # print(f"found checkpoint: {restore_file_path}")
-    # if restore_file_path is None:
-    #     exit(1)
+    restore_file_path = find_latest_checkpoint(checkpoint_pattern)
+    print(f"found checkpoint: {restore_file_path}")
+    if restore_file_path is None:
+        exit(1)
 
-    # 2. 加载检查点文件并只提取模型权重
-    # print(f"Loading checkpoint from {restore_file_path}...")
-    # checkpoint = torch.load(restore_file_path)
+    # # 2. 加载检查点文件并只提取模型权重
+    print(f"Loading checkpoint from {restore_file_path}...")
+    checkpoint = torch.load(restore_file_path)
     # print_dict_paths(checkpoint)
-    # print("Successfully extracted model weights.")
+    print("Successfully extracted model weights.")
     # 3. 配置并创建新环境的实验
     experiment_config = ExperimentConfig.get_from_yaml()
     # experiment_config.restore_file = restore_file_path
 
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S").replace(":", "-")
-    folder_name= f"outputs/{current_time}"
+    folder_name= f"/root/autodl-tmp/{current_time}"
     os.makedirs(folder_name)
     experiment_config.save_folder = folder_name
 
@@ -256,8 +262,8 @@ if __name__ == '__main__':
     attacker_algorithm_config.share_param_actor = True
     algorithm_config = EnsembleAlgorithmConfig({"attacker":attacker_algorithm_config, "defender":defender_algorithm_config})
     # algorithm_config = MappoConfig.get_from_yaml()
-    model_config = EnsembleModelConfig({"attacker":MlpConfig.get_from_yaml(), "defender":GruConfig.get_from_yaml()}) 
-    critic_model_config = EnsembleModelConfig({"attacker":MlpConfig.get_from_yaml(), "defender":GruConfig.get_from_yaml()}) 
+    model_config = GruConfig.get_from_yaml()
+    critic_model_config = GruConfig.get_from_yaml()
 
     # 创建一个全新的实验对象，所有状态都是初始化的
     experiment = Experiment(
@@ -273,17 +279,17 @@ if __name__ == '__main__':
 
     # 手动将预训练权重加载到新实验的模型中,actor和critic都恢复
     # 遍历新实验中的每一个智能体组
-    # for group in experiment.group_map.keys():
-    #     if group == "attacker" or True:
-    #         loss_key = f"loss_{group}"
-    #         if loss_key in checkpoint:
-    #             print(f"Loading weights for group '{group}' from '{loss_key}'...")
-    #             # experiment.losses[group] 是一个 LossModule，它包含了actor和critic网络
-    #             # 加载它的状态字典，就会恢复网络的权重
-    #             experiment.losses[group].load_state_dict(checkpoint[loss_key])
-    #             print(f"Successfully loaded weights for group '{group}'.")
-    #         else:
-    #             print(f"Warning: No weights found for group '{group}' in the checkpoint. Using freshly initialized weights.")
+    for group in experiment.group_map.keys():
+        if group == "attacker" or True:
+            loss_key = f"loss_{group}"
+            if loss_key in checkpoint:
+                print(f"Loading weights for group '{group}' from '{loss_key}'...")
+                # experiment.losses[group] 是一个 LossModule，它包含了actor和critic网络
+                # 加载它的状态字典，就会恢复网络的权重
+                experiment.losses[group].load_state_dict(checkpoint[loss_key])
+                print(f"Successfully loaded weights for group '{group}'.")
+            else:
+                print(f"Warning: No weights found for group '{group}' in the checkpoint. Using freshly initialized weights.")
     
     
     # 只恢复 actor 网络不恢复 critic
