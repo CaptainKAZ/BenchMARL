@@ -1,0 +1,13 @@
+
+name: gtrxl
+
+# GTrXL specific parameters from the RLlib implementation
+# You can customize these values for your experiments
+num_transformer_units: 1
+attention_dim: 96
+num_heads: 4
+head_dim: 24
+memory_training: 25
+position_wise_mlp_dim: 96
+init_gru_gate_bias: 2.0
+mlp_activation_class: torch.nn.Tanh

@@ -369,6 +369,15 @@ def _run_evaluation_process(
     # 3. REBUILD ALGORITHM and OTHER COMPONENTS
     # ====================================================================
 
+    try:
+        algorithm_config.device = eval_device
+        # 对于一些复杂的配置对象，可能需要更深层次的修改
+        # 例如 algorithm_config.config.train.device = eval_device
+        # 具体路径取决于您的 AlgorithmConfig 结构
+        print(f"[Eval Process]: Forced algorithm_config's device to '{eval_device}'.")
+    except Exception as e:
+        print(f"[Eval Process]: Warning - could not force algorithm_config device: {e}")
+
     # Now, create a more complete shell that includes the specs
     class ExperimentShell:
         def __init__(self):
@@ -725,20 +734,35 @@ class Experiment(CallbackNotifier):
             self.group_policies.update({group: group_policy[0]})
 
         if not self.config.collect_with_grad:
-            self.collector = MultiSyncDataCollector(
-                create_env_fn=[self.env_func for _ in range(self.config.n_workers)],
-                policy=self.policy,
-                device=self.config.sampling_device,
-                storing_device=self.config.sampling_device,
-                frames_per_batch=self.config.collected_frames_per_batch(self.on_policy),
-                total_frames=self.config.get_max_n_frames(self.on_policy),
-                init_random_frames=(
-                    self.config.off_policy_init_random_frames
-                    if not self.on_policy
-                    else -1
-                ),
-                cat_results=0,
-            )
+            if self.config.n_workers != 1:
+                self.collector = MultiSyncDataCollector(
+                    create_env_fn=[self.env_func for _ in range(self.config.n_workers)],
+                    policy=self.policy,
+                    device=self.config.sampling_device,
+                    storing_device=self.config.sampling_device,
+                    frames_per_batch=self.config.collected_frames_per_batch(self.on_policy),
+                    total_frames=self.config.get_max_n_frames(self.on_policy),
+                    init_random_frames=(
+                        self.config.off_policy_init_random_frames
+                        if not self.on_policy
+                        else -1
+                    ),
+                    cat_results=0,
+                )
+            else:
+                self.collector = SyncDataCollector(
+                    self.env_func,
+                    self.policy,
+                    device=self.config.sampling_device,
+                    storing_device=self.config.sampling_device,
+                    frames_per_batch=self.config.collected_frames_per_batch(self.on_policy),
+                    total_frames=self.config.get_max_n_frames(self.on_policy),
+                    init_random_frames=(
+                        self.config.off_policy_init_random_frames
+                        if not self.on_policy
+                        else 0
+                    ),
+                )
             self.collector.set_seed(self.seed)
         else:
             if self.config.off_policy_init_random_frames and not self.on_policy:

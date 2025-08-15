@@ -17,6 +17,8 @@ from .gnn import Gnn, GnnConfig
 from .gru import Gru, GruConfig
 from .lstm import Lstm, LstmConfig
 from .mlp import Mlp, MlpConfig
+from .gtrxl import GTrXL, GTrXLConfig
+from .attention import Attention,AttentionConfig
 
 classes = [
     "Mlp",
@@ -31,6 +33,8 @@ classes = [
     "GruConfig",
     "Lstm",
     "LstmConfig",
+    "GTrXL",
+    "attention"
 ]
 
 model_config_registry = {
@@ -40,4 +44,6 @@ model_config_registry = {
     "deepsets": DeepsetsConfig,
     "gru": GruConfig,
     "lstm": LstmConfig,
+    "gtrxl": GTrXLConfig,
+    "attention": AttentionConfig
 }
