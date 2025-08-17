@@ -887,6 +887,7 @@ class Experiment(CallbackNotifier):
         ):
             iteration_start = time.time()
             torch.cuda.empty_cache()
+            self.policy.eval()
             if not self.config.collect_with_grad:
                 batch = next(iterator)
             else:
@@ -912,6 +913,7 @@ class Experiment(CallbackNotifier):
             # Logging collection
             collection_time = time.time() - iteration_start
             print(f"collection time: {collection_time}")
+            self.policy.train()
             current_frames = batch.numel()
             self.total_frames += current_frames
             self.mean_return = self.logger.log_collection(

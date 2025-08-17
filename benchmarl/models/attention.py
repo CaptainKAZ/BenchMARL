@@ -13,7 +13,7 @@ class AttentionBlock(nn.Module):
     """
     标准的 Transformer 编码器层。
     """
-    def __init__(self, embedding_dim: int, num_heads: int, ffn_multiplier: int = 4, device=None):
+    def __init__(self, embedding_dim: int, num_heads: int, ffn_multiplier: int = 4, dropout_prob:float = 0.1, device=None):
         super().__init__()
         self.attention = nn.MultiheadAttention(
             embed_dim=embedding_dim, num_heads=num_heads, batch_first=True, device=device
@@ -25,14 +25,17 @@ class AttentionBlock(nn.Module):
         self.ffn = nn.Sequential(
             nn.Linear(embedding_dim, ffn_hidden_dim, device=device),
             nn.ReLU(),
+            nn.Dropout(dropout_prob),  # 添加 dropout 层
             nn.Linear(ffn_hidden_dim, embedding_dim, device=device),
         )
+        self.dropout = nn.Dropout(dropout_prob)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         attn_output, _ = self.attention(x, x, x)
         x = self.norm1(x + attn_output)
         ffn_output = self.ffn(x)
-        x = self.norm2(x + ffn_output)
+        x = x + self.dropout(ffn_output)
+        x = self.norm2(x)
         return x
 
 class Attention(Model):
@@ -47,6 +50,7 @@ class Attention(Model):
         num_attention_layers: int = 1,
         ffn_multiplier: int = 4,
         final_mlp_hidden_layers: List[int] = [256, 128],
+        dropout_prob: float = 0.1,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -68,7 +72,7 @@ class Attention(Model):
             
         # 注意力层
         self.attention_layers = nn.ModuleList(
-            [AttentionBlock(embedding_dim, num_heads, ffn_multiplier, device=self.device) for _ in range(num_attention_layers)]
+            [AttentionBlock(embedding_dim, num_heads, ffn_multiplier, dropout_prob, device=self.device) for _ in range(num_attention_layers)]
         )
         
         self.output_features = self.output_leaf_spec.shape[-1]
@@ -146,6 +150,7 @@ class AttentionConfig(ModelConfig):
     ffn_multiplier: int = 4
     final_mlp_hidden_layers: List[int] = field(default_factory=lambda: [256, 128])
     entity_configs: Dict[str, List[int]] = field(default_factory=dict)
+    dropout_prob: float = 0.1
 
     @staticmethod
     def associated_class():

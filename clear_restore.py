@@ -18,6 +18,8 @@ from benchmarl.models import EnsembleModelConfig
 from benchmarl.algorithms import EnsembleAlgorithmConfig
 from torch.profiler import profile, ProfilerActivity
 from collections import OrderedDict
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 # from torch.cuda.amp import GradScaler, autocast
 
 def print_dict_paths(d, path=""):
@@ -236,10 +238,10 @@ checkpoint_pattern="outputs/**/checkpoints/*.pt"
 if __name__ == '__main__':
     # 1. 定义预训练模型的路径
     # restore_file_path = find_latest_file(checkpoint_path,"*.pt")
-    restore_file_path = find_latest_checkpoint(checkpoint_pattern)
-    print(f"found checkpoint: {restore_file_path}")
-    if restore_file_path is None:
-        exit(1)
+    # restore_file_path = find_latest_checkpoint(checkpoint_pattern)
+    # print(f"found checkpoint: {restore_file_path}")
+    # if restore_file_path is None:
+    #     exit(1)
 
     # # # 2. 加载检查点文件并只提取模型权重
     # print(f"Loading checkpoint from {restore_file_path}...")
@@ -248,7 +250,7 @@ if __name__ == '__main__':
     # print("Successfully extracted model weights.")
     # 3. 配置并创建新环境的实验
     experiment_config = ExperimentConfig.get_from_yaml()
-    experiment_config.restore_file = restore_file_path
+    # experiment_config.restore_file = restore_file_path
 
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S").replace(":", "-")
     folder_name= f"outputs/{current_time}"
@@ -273,7 +275,7 @@ if __name__ == '__main__':
         algorithm_config=algorithm_config,
         model_config=model_config,
         critic_model_config=critic_model_config,
-        seed=69,
+        seed=114514,
         config=experiment_config,
         callbacks=[WinRateCurriculum()]
     )

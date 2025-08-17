@@ -1,10 +1,11 @@
 name: attention
 
-embedding_dim: 64
+embedding_dim: 48
 num_heads: 4
 num_attention_layers: 2
-ffn_multiplier: 4
-final_mlp_hidden_layers: [256, 256]
+ffn_multiplier: 2
+dropout_prob: 0.05
+final_mlp_hidden_layers: [64, 32]
 
 # 描述如何解析模型内部 (7, 4) 张量的结构
 # 格式: "嵌入层名称": [有效特征维度, 槽的数量]

@@ -198,7 +198,7 @@ class Mappo(Algorithm):
                     return_log_prob=True,
                     log_prob_key=(group, "log_prob"),
                 )
-
+        policy=torch.compile(policy)
         return policy
 
     def _get_policy_for_collection(
@@ -317,7 +317,7 @@ class Mappo(Algorithm):
                 out_keys=[(group, "state_value")],
             )
             value_module = TensorDictSequential(value_module, expand_module)
-
+        value_module = torch.compile(value_module)
         return value_module
 
 
