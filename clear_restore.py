@@ -2,7 +2,7 @@ from sympy import true
 import torch
 from wandb import restore
 from benchmarl.algorithms import MappoConfig
-from benchmarl.environments import VmasTask # 替换为您重构后的新环境
+from benchmarl.environments import LayupTask # 替换为您重构后的新环境
 from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.models.gru import GruConfig
 from benchmarl.models.gtrxl import GTrXLConfig
@@ -202,7 +202,7 @@ class WinRateCurriculum(Callback):
             # win_rate = total_shots_in_batch / total_dones_in_batch if total_dones_in_batch > 0 else 0.0
             print(f"Win rate: {win_rate:.2f}")
 
-            if self.experiment.n_iters_performed < 20 or self.experiment.n_iters_performed % 50 < 3:
+            if self.experiment.n_iters_performed < 20: #or self.experiment.n_iters_performed % 50 < 3:
                 self.experiment.train_group_map = new_train_map
                 return
 
@@ -258,7 +258,7 @@ if __name__ == '__main__':
     experiment_config.save_folder = folder_name
 
     # 使用您重构后的新环境
-    new_task = VmasTask.LAYUP.get_from_yaml() 
+    new_task = LayupTask.LAYUP.get_from_yaml() 
 
     attacker_algorithm_config = MappoConfig.get_from_yaml()
     attacker_algorithm_config.share_param_actor = False
@@ -284,7 +284,7 @@ if __name__ == '__main__':
     # 手动将预训练权重加载到新实验的模型中,actor和critic都恢复
     # 遍历新实验中的每一个智能体组
     # for group in experiment.group_map.keys():
-    #     if group == "attacker" or True:
+    #     if group == "attacker" :
     #         loss_key = f"loss_{group}"
     #         if loss_key in checkpoint:
     #             print(f"Loading weights for group '{group}' from '{loss_key}'...")
