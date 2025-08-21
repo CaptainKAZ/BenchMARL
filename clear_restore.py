@@ -202,9 +202,9 @@ class WinRateCurriculum(Callback):
             # win_rate = total_shots_in_batch / total_dones_in_batch if total_dones_in_batch > 0 else 0.0
             print(f"Win rate: {win_rate:.2f}")
 
-            if self.experiment.n_iters_performed < 20: #or self.experiment.n_iters_performed % 50 < 3:
-                self.experiment.train_group_map = new_train_map
-                return
+            # if self.experiment.n_iters_performed < 20: #or self.experiment.n_iters_performed % 50 < 3:
+            #     self.experiment.train_group_map = new_train_map
+            #     return
 
             # 2. 根据比率决定本次迭代要训练哪些组
             if win_rate < self.win_rate_threshold and total_dones_in_batch > 0:
@@ -214,8 +214,8 @@ class WinRateCurriculum(Callback):
                 print(f"\n[WinRateCurriculum] Win rate ({win_rate:.2f}) is LOW. Training groups: {list(new_train_map.keys())}")
             elif win_rate > 1 - self.win_rate_threshold and total_dones_in_batch > 0:
                 # 胜率高，只训练防守方。我们从训练地图中移除进攻方。
-                # if "attacker" in new_train_map:
-                #     del new_train_map["attacker"]
+                if "attacker" in new_train_map:
+                    del new_train_map["attacker"]
                 print(f"\n[WinRateCurriculum] Win rate ({win_rate:.2f}) is HIGH. Training groups: {list(new_train_map.keys())}")
             else:
                 # 胜率达标，训练所有组 (new_train_map 已经是所有组了)
@@ -238,16 +238,16 @@ checkpoint_pattern="outputs/**/checkpoints/*.pt"
 if __name__ == '__main__':
     # 1. 定义预训练模型的路径
     # restore_file_path = find_latest_file(checkpoint_path,"*.pt")
-    # restore_file_path = find_latest_checkpoint(checkpoint_pattern)
-    # print(f"found checkpoint: {restore_file_path}")
-    # if restore_file_path is None:
-    #     exit(1)
+    restore_file_path = find_latest_checkpoint(checkpoint_pattern)
+    print(f"found checkpoint: {restore_file_path}")
+    if restore_file_path is None:
+        exit(1)
 
     # # # 2. 加载检查点文件并只提取模型权重
-    # print(f"Loading checkpoint from {restore_file_path}...")
-    # checkpoint = torch.load(restore_file_path)
-    # # print_dict_paths(checkpoint)
-    # print("Successfully extracted model weights.")
+    print(f"Loading checkpoint from {restore_file_path}...")
+    checkpoint = torch.load(restore_file_path)
+    # print_dict_paths(checkpoint)
+    print("Successfully extracted model weights.")
     # 3. 配置并创建新环境的实验
     experiment_config = ExperimentConfig.get_from_yaml()
     # experiment_config.restore_file = restore_file_path
@@ -283,17 +283,17 @@ if __name__ == '__main__':
 
     # 手动将预训练权重加载到新实验的模型中,actor和critic都恢复
     # 遍历新实验中的每一个智能体组
-    # for group in experiment.group_map.keys():
-    #     if group == "attacker" :
-    #         loss_key = f"loss_{group}"
-    #         if loss_key in checkpoint:
-    #             print(f"Loading weights for group '{group}' from '{loss_key}'...")
-    #             # experiment.losses[group] 是一个 LossModule，它包含了actor和critic网络
-    #             # 加载它的状态字典，就会恢复网络的权重
-    #             experiment.losses[group].load_state_dict(checkpoint[loss_key])
-    #             print(f"Successfully loaded weights for group '{group}'.")
-    #         else:
-    #             print(f"Warning: No weights found for group '{group}' in the checkpoint. Using freshly initialized weights.")
+    for group in experiment.group_map.keys():
+        if group == "attacker":
+            loss_key = f"loss_{group}"
+            if loss_key in checkpoint:
+                print(f"Loading weights for group '{group}' from '{loss_key}'...")
+                # experiment.losses[group] 是一个 LossModule，它包含了actor和critic网络
+                # 加载它的状态字典，就会恢复网络的权重
+                experiment.losses[group].load_state_dict(checkpoint[loss_key])
+                print(f"Successfully loaded weights for group '{group}'.")
+            else:
+                print(f"Warning: No weights found for group '{group}' in the checkpoint. Using freshly initialized weights.")
     
     
     # 只恢复 actor 网络不恢复 critic

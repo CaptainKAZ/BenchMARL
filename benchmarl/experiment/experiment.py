@@ -927,7 +927,7 @@ class Experiment(CallbackNotifier):
             # Callback
             self._on_batch_collected(batch)
             batch = batch.detach()
-
+            torch.cuda.empty_cache()
             # Loop over groups
             training_start = time.time()
             for group in self.train_group_map.keys():

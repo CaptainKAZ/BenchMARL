@@ -33,7 +33,7 @@ class AttentionBlock(nn.Module):
         ffn_hidden_dim = embedding_dim * ffn_multiplier
         self.ffn = nn.Sequential(
             nn.Linear(embedding_dim, ffn_hidden_dim, device=device),
-            nn.ReLU(),
+            nn.ReLU(), # 下次冷启动换成GELU
             nn.Linear(ffn_hidden_dim, embedding_dim, device=device),
         )
 
@@ -123,7 +123,13 @@ class Attention(Model):
                 device=self.device,
             )
         else:
-            self.final_mlp = nn.Linear(self.num_total_entities * self.embedding_dim, self.output_features, device=self.device)
+            self.final_mlp = MLP(
+                in_features=self.num_total_entities * self.embedding_dim,
+                out_features=self.output_features,
+                num_cells=final_mlp_hidden_layers,
+                activation_class=nn.Tanh,
+                device=self.device,
+            )
 
     def _forward(self, tensordict: TensorDictBase) -> TensorDictBase:
         input_tensor = torch.cat([tensordict.get(key) for key in self.in_keys], dim=-1)

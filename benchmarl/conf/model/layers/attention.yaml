@@ -4,7 +4,7 @@ embedding_dim: 64
 num_heads: 4
 num_attention_layers: 2
 ffn_multiplier: 2
-dropout_prob: 0.05
+dropout_prob: 0
 final_mlp_hidden_layers: [64, 32]
 
 # 描述如何解析模型内部 张量的结构
