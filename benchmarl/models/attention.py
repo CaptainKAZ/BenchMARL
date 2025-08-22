@@ -33,7 +33,7 @@ class AttentionBlock(nn.Module):
         ffn_hidden_dim = embedding_dim * ffn_multiplier
         self.ffn = nn.Sequential(
             nn.Linear(embedding_dim, ffn_hidden_dim, device=device),
-            nn.ReLU(), # 下次冷启动换成GELU
+            nn.LeakyReLU(),
             nn.Linear(ffn_hidden_dim, embedding_dim, device=device),
         )
 

@@ -237,101 +237,12 @@ checkpoint_pattern="outputs/**/checkpoints/*.pt"
 
 if __name__ == '__main__':
     # 1. 定义预训练模型的路径
-    # restore_file_path = find_latest_file(checkpoint_path,"*.pt")
     restore_file_path = find_latest_checkpoint(checkpoint_pattern)
     print(f"found checkpoint: {restore_file_path}")
     if restore_file_path is None:
         exit(1)
 
-    # # # 2. 加载检查点文件并只提取模型权重
-    print(f"Loading checkpoint from {restore_file_path}...")
-    checkpoint = torch.load(restore_file_path)
-    # print_dict_paths(checkpoint)
-    print("Successfully extracted model weights.")
-    # 3. 配置并创建新环境的实验
-    experiment_config = ExperimentConfig.get_from_yaml()
-    # experiment_config.restore_file = restore_file_path
-
-    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S").replace(":", "-")
-    folder_name= f"outputs/{current_time}"
-    os.makedirs(folder_name)
-    experiment_config.save_folder = folder_name
-
-    # 使用您重构后的新环境
-    new_task = LayupTask.LAYUP.get_from_yaml() 
-
-    attacker_algorithm_config = MappoConfig.get_from_yaml()
-    attacker_algorithm_config.share_param_actor = False
-    defender_algorithm_config = MappoConfig.get_from_yaml()
-    attacker_algorithm_config.share_param_actor = True
-    algorithm_config = EnsembleAlgorithmConfig({"attacker":attacker_algorithm_config, "defender":defender_algorithm_config})
-    # algorithm_config = MappoConfig.get_from_yaml()
-    model_config = AttentionConfig.get_from_yaml()
-    critic_model_config = AttentionConfig.get_from_yaml()
-
-    # 创建一个全新的实验对象，所有状态都是初始化的
-    experiment = Experiment(
-        task=new_task,
-        algorithm_config=algorithm_config,
-        model_config=model_config,
-        critic_model_config=critic_model_config,
-        seed=114514,
-        config=experiment_config,
-        callbacks=[WinRateCurriculum()]
-    )
-    print("New experiment created with fresh training states (optimizers, buffers, etc.).")
-
-    # 手动将预训练权重加载到新实验的模型中,actor和critic都恢复
-    # 遍历新实验中的每一个智能体组
-    for group in experiment.group_map.keys():
-        if group == "attacker" or True:
-            loss_key = f"loss_{group}"
-            if loss_key in checkpoint:
-                print(f"Loading weights for group '{group}' from '{loss_key}'...")
-                # experiment.losses[group] 是一个 LossModule，它包含了actor和critic网络
-                # 加载它的状态字典，就会恢复网络的权重
-                experiment.losses[group].load_state_dict(checkpoint[loss_key])
-                print(f"Successfully loaded weights for group '{group}'.")
-            else:
-                print(f"Warning: No weights found for group '{group}' in the checkpoint. Using freshly initialized weights.")
-    
-    
-    # 只恢复 actor 网络不恢复 critic
-    # ACTOR_PREFIX = "actor_network_params."
-    # for group in experiment.group_map.keys():
-    #     if group == "defender" or True:
-    #         loss_key = f"loss_{group}"
-    #         if loss_key in checkpoint:
-    #             print(f"Partially loading ONLY ACTOR weights for group '{group}'...")
-
-    #             # 1. 从 checkpoint 中获取该 group 的完整状态字典
-    #             full_group_state_dict = checkpoint[loss_key]
-
-    #             # 2. 筛选出 actor 的所有参数（不再检查类型），并移除key的前缀
-    #             #    这样就会把 __batch_size (torch.Size) 和 __device (NoneType) 也包含进来
-    #             actor_state_dict = {
-    #                 key.removeprefix(ACTOR_PREFIX): value
-    #                 for key, value in full_group_state_dict.items()
-    #                 if key.startswith(ACTOR_PREFIX)
-    #             }
-
-    #             # 3. 将筛选后的 state_dict 加载到 actor 网络中
-    #             try:
-    #                 actor_network = experiment.losses[group].actor_network_params
-                    
-    #                 # 使用 strict=False 增加加载的灵活性，这是一个好习惯
-    #                 # 它会加载所有匹配的键，并忽略不匹配的键，从而避免因细微差异导致的错误
-    #                 actor_network.load_state_dict(actor_state_dict, strict=False)
-                    
-    #                 print(f"Successfully loaded actor weights for group '{group}'.")
-    #             except AttributeError:
-    #                 print(f"[Error] Could not find attribute 'actor_network_params' in LossModule for group '{group}'. Please check the model definition.")
-    #             except Exception as e:
-    #                 print(f"[Error] Failed to load weights for group '{group}': {e}")
-
-    print("The optimizer, replay buffer, and collector states remain freshly initialized as intended.")
-
-    # 5. 开始在新环境上训练
-    print("\nStarting training on the new environment...")
-
-    experiment.run()
+    exp = Experiment.reload_from_file(restore_file_path)
+    exp.seed = 0
+    torch.manual_seed(1)
+    exp.evaluate()
