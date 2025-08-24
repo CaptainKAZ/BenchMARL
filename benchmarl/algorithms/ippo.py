@@ -53,6 +53,8 @@ class Ippo(Algorithm):
         scale_mapping: str,
         use_tanh_normal: bool,
         minibatch_advantage: bool,
+        share_param_actor: bool,
+        critic_obs_key: str,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -66,6 +68,8 @@ class Ippo(Algorithm):
         self.scale_mapping = scale_mapping
         self.use_tanh_normal = use_tanh_normal
         self.minibatch_advantage = minibatch_advantage
+        self.share_param_actor = share_param_actor
+        self.critic_obs_key = critic_obs_key
 
     #############################
     # Overridden abstract methods
@@ -137,7 +141,7 @@ class Ippo(Algorithm):
             input_has_agent_dim=True,
             n_agents=n_agents,
             centralised=False,
-            share_params=self.experiment_config.share_policy_params,
+            share_params=self.share_param_actor,
             device=self.device,
             action_spec=self.action_spec,
         )
@@ -269,10 +273,20 @@ class Ippo(Algorithm):
 
     def get_critic(self, group: str) -> TensorDictModule:
         n_agents = len(self.group_map[group])
+        try:
+            critic_obs_spec = self.full_observation_spec[group, self.critic_obs_key].clone()
+        except KeyError:
+            raise KeyError(
+                f"The observation spec for group '{group}' does not contain the required '{self.critic_obs_key}' key."
+                " Please ensure your custom environment provides it."
+            )
 
+        # 构建 Critic 模型期望的输入规格
+        # 它的输入 TensorDict 结构是: {group: {"critic_obs": tensordata}}
         critic_input_spec = Composite(
-            {group: self.observation_spec[group].clone().to(self.device)}
+            {group: Composite({self.critic_obs_key: critic_obs_spec}).to(self.device)}
         )
+        
         critic_output_spec = Composite(
             {
                 group: Composite(
@@ -281,11 +295,13 @@ class Ippo(Algorithm):
                 )
             }
         )
+        
+        # 创建 Critic 模型，它将自动从 batch 中选择 critic_input_spec 定义的输入
         value_module = self.critic_model_config.get_model(
             input_spec=critic_input_spec,
             output_spec=critic_output_spec,
             n_agents=n_agents,
-            centralised=False,
+            centralised=False, # IPPO critic is decentralized
             input_has_agent_dim=True,
             agent_group=group,
             share_params=self.share_param_critic,
@@ -309,7 +325,8 @@ class IppoConfig(AlgorithmConfig):
     scale_mapping: str = MISSING
     use_tanh_normal: bool = MISSING
     minibatch_advantage: bool = MISSING
-
+    share_param_actor: bool = MISSING
+    critic_obs_key: str = "observation"
     @staticmethod
     def associated_class() -> Type[Algorithm]:
         return Ippo
