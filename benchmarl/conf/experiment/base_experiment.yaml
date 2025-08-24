@@ -54,16 +54,16 @@ max_n_frames: null
 n_workers: 1
 
 # Number of frames collected and each experiment iteration
-on_policy_collected_frames_per_batch: 240000
+on_policy_collected_frames_per_batch: 210000
 # Number of environments used for collection
 # If the environment is vectorized, this will be the number of batched environments.
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
-on_policy_n_envs_per_worker: 24000
+on_policy_n_envs_per_worker: 7000
 # This is the number of times collected_frames_per_batch will be split into minibatches and trained
 on_policy_n_minibatch_iters: 30
 # In on-policy algorithms the train_batch_size will be equal to the on_policy_collected_frames_per_batch
 # and it will be split into minibatches with this number of frames for training
-on_policy_minibatch_size: 60000
+on_policy_minibatch_size: 70000
 
 # Number of frames collected and each experiment iteration
 off_policy_collected_frames_per_batch: 81920
@@ -92,7 +92,7 @@ evaluation: True
 # Whether to render the evaluation (if rendering is available)
 render: True
 # Frequency of evaluation in terms of collected frames (this should be a multiple of on/off_policy_collected_frames_per_batch)
-evaluation_interval: 2400000
+evaluation_interval: 1050000
 # Number of episodes that evaluation is run on
 evaluation_episodes: 16
 # If True, when stochastic policies are evaluated, their deterministic value is taken, otherwise, if False, they are sampled
@@ -124,7 +124,7 @@ restore_file: null
 restore_map_location: null
 # Interval for experiment saving in terms of collected frames (this should be a multiple of on/off_policy_collected_frames_per_batch).
 # Set it to 0 to disable checkpointing
-checkpoint_interval: 2400000
+checkpoint_interval: 1050000
 # Whether to checkpoint when the experiment is done
 checkpoint_at_end: True
 # How many checkpoints to keep. As new checkpoints are taken, temporally older checkpoints are deleted to keep this number of

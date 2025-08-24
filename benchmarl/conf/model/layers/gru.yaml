@@ -5,9 +5,9 @@ hidden_size: 128
 n_layers: 1
 bias: True
 dropout: 0
-compile: False
+compile: True
 
-mlp_num_cells: [256, 256]
+mlp_num_cells: [64]
 mlp_layer_class: torch.nn.Linear
 mlp_activation_class: torch.nn.Tanh
 mlp_activation_kwargs: null
