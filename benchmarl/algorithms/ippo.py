@@ -122,9 +122,18 @@ class Ippo(Algorithm):
                 self.action_spec[group, "action"].space.n,
             ]
 
-        actor_input_spec = Composite(
-            {group: self.observation_spec[group].clone().to(self.device)}
-        )
+        try:
+            actor_obs_spec = self.observation_spec[group, "observation"].clone()
+        except KeyError:
+            raise KeyError(
+                f"The observation spec for group '{group}' is missing the required 'observation' key for the actor."
+            )
+        actor_input_spec = Composite({
+            group: Composite(
+                {"observation": actor_obs_spec}, 
+                shape=torch.Size([n_agents])
+            ).to(self.device)
+        })
 
         actor_output_spec = Composite(
             {
@@ -274,7 +283,7 @@ class Ippo(Algorithm):
     def get_critic(self, group: str) -> TensorDictModule:
         n_agents = len(self.group_map[group])
         try:
-            critic_obs_spec = self.full_observation_spec[group, self.critic_obs_key].clone()
+            critic_obs_spec = self.observation_spec[group, self.critic_obs_key].clone()
         except KeyError:
             raise KeyError(
                 f"The observation spec for group '{group}' does not contain the required '{self.critic_obs_key}' key."
@@ -282,9 +291,9 @@ class Ippo(Algorithm):
             )
 
         # 构建 Critic 模型期望的输入规格
-        # 它的输入 TensorDict 结构是: {group: {"critic_obs": tensordata}}
         critic_input_spec = Composite(
-            {group: Composite({self.critic_obs_key: critic_obs_spec}).to(self.device)}
+            {group: Composite({self.critic_obs_key: critic_obs_spec}, 
+                shape=torch.Size([n_agents])).to(self.device)}
         )
         
         critic_output_spec = Composite(

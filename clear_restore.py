@@ -1,7 +1,8 @@
-from sympy import true
+from sympy import im, true
 import torch
 from wandb import restore
 from benchmarl.algorithms import MappoConfig
+from benchmarl.algorithms import IppoConfig
 from benchmarl.environments import LayupTask # 替换为您重构后的新环境
 from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.models.gru import GruConfig
@@ -176,62 +177,22 @@ class WinRateCurriculum(Callback):
         在每个数据批次收集完成之后，训练开始之前被调用。
         这是实现我们核心逻辑的地方。
         """
-        
-        # 默认情况下，我们计划训练所有原始组
-        new_train_map = self.original_group_map.copy()
-
         try:
             # 1. 从 batch 中计算胜率
             # 'shots_in_step' 来自您 layup.py 的 info() 函数
             # win_info = batch.get(("attacker", "info", "win_in_step"))[...,0,:]
             done_info = batch.get(("next", "done"))
-            reason_codes_tensor = batch.get(("next", "attacker", "info", "termination_reason"))[...,0,:]
+            reason_codes_tensor = batch.get(("next", "agents", "info", "termination_reason"))[...,0,:]
             reason_codes = reason_codes_tensor.squeeze(-1)
             dones_mask = done_info.squeeze(-1).bool()
             terminated_codes_in_batch = reason_codes[dones_mask] # 得到一个一维张量，长度不定
             win_rate = log_and_calculate_win_rate(terminated_codes_in_batch,{1,2,3,4,5})
-            # total_shots_in_batch = win_info.sum().item()
-            # # 'done' 标志着一个回合的结束
-            total_dones_in_batch = done_info.sum().item()
 
-            # # 课程学习，先学会进攻
-            # if "defender" in new_train_map:
-            #     del new_train_map["defender"]
-            # return
-
-            # # 计算在所有结束的回合中，由投篮导致的比率
-            # win_rate = total_shots_in_batch / total_dones_in_batch if total_dones_in_batch > 0 else 0.0
             print(f"Win rate: {win_rate:.2f}")
-
-            if self.experiment.n_iters_performed < 20: #or self.experiment.n_iters_performed % 50 < 3:
-                self.experiment.train_group_map = new_train_map
-                return
-
-            # 2. 根据比率决定本次迭代要训练哪些组
-            if win_rate < self.win_rate_threshold and total_dones_in_batch > 0:
-                # 胜率低，只训练进攻方。我们从训练地图中移除防守方。
-                if "defender" in new_train_map:
-                    del new_train_map["defender"]
-                print(f"\n[WinRateCurriculum] Win rate ({win_rate:.2f}) is LOW. Training groups: {list(new_train_map.keys())}")
-            elif win_rate > 1 - self.win_rate_threshold and total_dones_in_batch > 0:
-                # 胜率高，只训练防守方。我们从训练地图中移除进攻方。
-                if "attacker" in new_train_map:
-                    del new_train_map["attacker"]
-                print(f"\n[WinRateCurriculum] Win rate ({win_rate:.2f}) is HIGH. Training groups: {list(new_train_map.keys())}")
-            else:
-                # 胜率达标，训练所有组 (new_train_map 已经是所有组了)
-                if total_dones_in_batch > 0:
-                    print(f"\n[WinRateCurriculum] Win rate ({win_rate:.2f}) is GOOD. Training all groups: {list(new_train_map.keys())}")
         
         except (KeyError, AttributeError) as e:
-            # 如果在 batch 中找不到所需信息 (例如，在第一次迭代时)，则默认训练所有组
-            print(f"\n[WinRateCurriculum] Could not compute win rate ({e}). Defaulting to train all groups.")
             pass
 
-        # 3. 【核心】更新 Experiment 的 train_group_map
-        # 这是我们与 Experiment 交互的“暴露接口”。
-        # 下一个训练循环将只会遍历我们在这里设置的组。
-        self.experiment.train_group_map = new_train_map
 
 # checkpoint_path = "outputs/2025-07-06_19-39-05/mappo_layup_gru__c217740f_25_07_06-19_39_05/checkpoints"
 checkpoint_pattern="outputs/**/checkpoints/*.pt"
@@ -261,11 +222,7 @@ if __name__ == '__main__':
     # 使用您重构后的新环境
     new_task = LayupTask.LAYUP.get_from_yaml() 
 
-    attacker_algorithm_config = MappoConfig.get_from_yaml()
-    attacker_algorithm_config.share_param_actor = False
-    defender_algorithm_config = MappoConfig.get_from_yaml()
-    attacker_algorithm_config.share_param_actor = True
-    algorithm_config = EnsembleAlgorithmConfig({"attacker":attacker_algorithm_config, "defender":defender_algorithm_config})
+    algorithm_config = IppoConfig.get_from_yaml()
     # algorithm_config = MappoConfig.get_from_yaml()
     attention_model_config = AttentionConfig.get_from_yaml()
     attention_model_config.num_attention_layers = 2

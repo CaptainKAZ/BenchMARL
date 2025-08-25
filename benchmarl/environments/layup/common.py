@@ -30,40 +30,31 @@ class VmasEnvWithState(VmasEnv):
     def _make_specs(
         self, env: vmas.simulator.environment.environment.Environment
     ) -> None:
+        # 关键经验：所有对spec的修改，都必须在带批处理维度的 `self.full_observation_spec` 上进行才能生效。
         super()._make_specs(env)
 
-        # 检查 scenario 是否有 get_all_critic_obs 方法
         if not hasattr(self._env.scenario, "get_all_critic_obs"):
             raise AttributeError(
-                "The environment's scenario must have a 'get_all_critic_obs()' method "
-                "that returns a tensor of shape [B, N, D_critic_obs]."
+                "The environment's scenario must have a 'get_all_critic_obs()' method."
             )
-
-        # 1. 获取完整的 critic_obs 样本以确定形状和类型
         sample_critic_obs_matrix = self._env.scenario.get_all_critic_obs()
-        # 样本形状为 [B, N, D_critic_obs], 我们需要 unbatched shape, 即 [N, D_critic_obs]
+        
         unbatched_shape = sample_critic_obs_matrix.shape[1:]
-        n_agents = unbatched_shape[0]
-
-        # 2. 为 critic_obs 创建 spec
-        critic_obs_spec = Unbounded(
+        unbatched_critic_obs_spec = Unbounded(
             shape=unbatched_shape,
             device=self.device,
             dtype=sample_critic_obs_matrix.dtype,
         )
-
-        # 3. 将 critic_obs_spec 添加到每个 group 的观测空间中
-        #    在这个实现中，我们假设只有一个包含所有智能体的 group
-        if len(self.group_map) != 1:
-            raise NotImplementedError(
-                "This VmasEnvWithState implementation assumes a single agent group."
-            )
+        
+        batched_critic_obs_spec = unbatched_critic_obs_spec.expand(
+            self.batch_size + unbatched_critic_obs_spec.shape
+        )
+        
         group = next(iter(self.group_map.keys()))
-        if self.group_map[group] != n_agents:
-             # Sanity check
-             pass
-
-        self.full_observation_spec_unbatched[group, "critic_obs"] = critic_obs_spec
+        
+        group_spec = self.full_observation_spec[group]
+        group_spec["critic_obs"] = batched_critic_obs_spec
+        self.full_observation_spec[group] = group_spec
 
     def _reset(
         self, tensordict: TensorDictBase | None = None, **kwargs
@@ -158,9 +149,9 @@ class LayupClass(TaskClass):
         for group in self.group_map(env):
             if "info" in observation_spec[group]:
                 del observation_spec[(group, "info")]
-            # 从 Actor 的观测空间中移除 critic_obs
-            if "critic_obs" in observation_spec[group]:
-                del observation_spec[(group, "critic_obs")]
+            # # 从 Actor 的观测空间中移除 critic_obs
+            # if "critic_obs" in observation_spec[group]:
+            #     del observation_spec[(group, "critic_obs")]
         if "state" in observation_spec:
             del observation_spec["state"]
         return observation_spec

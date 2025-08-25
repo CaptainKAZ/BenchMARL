@@ -369,14 +369,14 @@ def _run_evaluation_process(
     # 3. REBUILD ALGORITHM and OTHER COMPONENTS
     # ====================================================================
 
-    try:
-        algorithm_config.device = eval_device
-        # 对于一些复杂的配置对象，可能需要更深层次的修改
-        # 例如 algorithm_config.config.train.device = eval_device
-        # 具体路径取决于您的 AlgorithmConfig 结构
-        print(f"[Eval Process]: Forced algorithm_config's device to '{eval_device}'.")
-    except Exception as e:
-        print(f"[Eval Process]: Warning - could not force algorithm_config device: {e}")
+    # try:
+    #     algorithm_config.device = eval_device
+    #     # 对于一些复杂的配置对象，可能需要更深层次的修改
+    #     # 例如 algorithm_config.config.train.device = eval_device
+    #     # 具体路径取决于您的 AlgorithmConfig 结构
+    #     print(f"[Eval Process]: Forced algorithm_config's device to '{eval_device}'.")
+    # except Exception as e:
+    #     print(f"[Eval Process]: Warning - could not force algorithm_config device: {e}")
 
     # Now, create a more complete shell that includes the specs
     class ExperimentShell:
