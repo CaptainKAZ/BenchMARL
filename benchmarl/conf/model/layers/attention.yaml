@@ -2,11 +2,11 @@
 # 1. 模型结构超参数
 # ==================================
 name: attention
-embedding_dim: 64
+embedding_dim: 48
 num_heads: 4
 num_attention_layers: 2
 ffn_multiplier: 4
-dropout_prob: 0.00
+dropout_prob: 0
 final_mlp_hidden_layers: [64,64]
 
 # ==================================

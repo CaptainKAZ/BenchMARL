@@ -148,7 +148,7 @@ def log_and_calculate_win_rate(terminated_codes: torch.Tensor, win_codes: Set[in
     return win_rate
 
 
-class WinRateCurriculum(Callback):
+class WinRateReport(Callback):
     """
     一个自定义回调，根据胜率动态调整训练的智能体组。
 
@@ -225,19 +225,18 @@ if __name__ == '__main__':
     algorithm_config = IppoConfig.get_from_yaml()
     # algorithm_config = MappoConfig.get_from_yaml()
     attention_model_config = AttentionConfig.get_from_yaml()
-    attention_model_config.num_attention_layers = 2
-    attention_model_config.final_mlp_hidden_layers = [64,64]
     model_config = SequenceModelConfig(
         model_configs=[
             attention_model_config,
             GruConfig.get_from_yaml(),
         ],
         intermediate_sizes=[
-            64
+            48
         ],  # Nuber of intermediate outputs. List of size n_layers - 1
     )
+    print(model_config)
     # model_config = EnsembleModelConfig({"attacker":attacker_model_config, "defender":defender_model_config})
-    critic_model_config = AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_critic.yaml")
+    critic_model_config = model_config
 
         
 
@@ -249,7 +248,7 @@ if __name__ == '__main__':
         critic_model_config=critic_model_config,
         seed=114514,
         config=experiment_config,
-        callbacks=[WinRateCurriculum()]
+        callbacks=[WinRateReport()]
     )
     print("New experiment created with fresh training states (optimizers, buffers, etc.).")
 

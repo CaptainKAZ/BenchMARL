@@ -206,7 +206,7 @@ class Ippo(Algorithm):
                     log_prob_key=(group, "log_prob"),
                 )
 
-        return policy
+        return torch.compile(policy)
 
     def _get_policy_for_collection(
         self, policy_for_loss: TensorDictModule, group: str, continuous: bool
@@ -318,7 +318,7 @@ class Ippo(Algorithm):
             action_spec=self.action_spec,
         )
 
-        return value_module
+        return torch.compile(value_module)
 
 
 @dataclass
