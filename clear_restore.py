@@ -231,7 +231,7 @@ if __name__ == '__main__':
             GruConfig.get_from_yaml(),
         ],
         intermediate_sizes=[
-            48
+            128
         ],  # Nuber of intermediate outputs. List of size n_layers - 1
     )
     print(model_config)

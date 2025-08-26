@@ -7,9 +7,10 @@ bias: True
 dropout: 0
 compile: True
 
-mlp_num_cells: [64]
+mlp_num_cells: [128,128]
 mlp_layer_class: torch.nn.Linear
 mlp_activation_class: torch.nn.Tanh
 mlp_activation_kwargs: null
-mlp_norm_class: null
-mlp_norm_kwargs: null
+mlp_norm_class: torch.nn.LayerNorm
+mlp_norm_kwargs:
+  normalized_shape: 128

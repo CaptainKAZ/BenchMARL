@@ -7,6 +7,7 @@
 from dataclasses import dataclass, MISSING
 from typing import Dict, Iterable, Tuple, Type
 
+from sympy import true
 import torch
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModule, TensorDictSequential
@@ -86,7 +87,8 @@ class Ippo(Algorithm):
             entropy_coef=self.entropy_coef,
             critic_coef=self.critic_coef,
             loss_critic_type=self.loss_critic_type,
-            normalize_advantage=False,
+            normalize_advantage=True,
+            normalize_advantage_exclude_dims=[-2]
         )
         loss_module.set_keys(
             reward=(group, "reward"),
