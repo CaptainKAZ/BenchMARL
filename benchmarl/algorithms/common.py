@@ -159,7 +159,7 @@ class Algorithm(ABC):
         if self.has_rnn:
             sequence_length = -(
                 -self.experiment_config.collected_frames_per_batch(self.on_policy)
-                // self.experiment_config.n_envs_per_worker(self.on_policy)
+                // (self.experiment_config.n_envs_per_worker(self.on_policy) * self.experiment_config.n_workers)
             )
             memory_size = -(-memory_size // sequence_length)
             sampling_size = -(-sampling_size // sequence_length)
