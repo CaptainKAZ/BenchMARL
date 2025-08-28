@@ -271,7 +271,7 @@ if __name__ == '__main__':
     # algorithm_config = MappoConfig.get_from_yaml()
     attacker_model_config = SequenceModelConfig(
         model_configs=[
-            AttentionConfig.get_from_yaml("BenchMARL/benchmarl/conf/model/layers/attention_attacker.yaml"),
+            AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_attacker.yaml"),
             GruConfig.get_from_yaml(),
         ],
         intermediate_sizes=[
@@ -280,7 +280,7 @@ if __name__ == '__main__':
     )
     defender_model_config = SequenceModelConfig(
         model_configs=[
-            AttentionConfig.get_from_yaml("BenchMARL/benchmarl/conf/model/layers/attention_defender.yaml"),
+            AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_defender.yaml"),
             GruConfig.get_from_yaml(),
         ],
         intermediate_sizes=[
