@@ -8,6 +8,7 @@ num_attention_layers: 2
 ffn_multiplier: 4
 dropout_prob: 0
 final_mlp_hidden_layers: [128]
+use_ego_embedding: True
 
 # ==================================
 # 2. 输入数据结构定义
@@ -18,7 +19,9 @@ final_mlp_hidden_layers: [128]
 # 你可以任意调整这里的顺序，只要它与环境输出的扁平向量一致。
 input_feature_order:
   - self_embed
-  - agent_embed
+  - teammate_embed
+  - opponent1_embed
+  - opponent2_embed
   - spot_embed
   - basket_embed
   - time
@@ -29,7 +32,9 @@ input_feature_order:
 roles:
   entity:
     - self_embed
-    - agent_embed
+    - teammate_embed
+    - opponent1_embed
+    - opponent2_embed
     - spot_embed
     - basket_embed
   global:
@@ -39,10 +44,14 @@ roles:
 # 格式: { dim: 每个单位的特征维度, num: 单位的数量 }
 definitions:
   # 自身编码方式和队友对手的不一致
-  self_embed:   { dim: 7, num: 1 }
+  self_embed:   { dim: 4, num: 1 }
 
-  # 3个智能体 (队友, 对手1, 对手2)，每个由4维向量(相对x,y,相对vx,vy)表示
-  agent_embed:  { dim: 4, num: 3 }
+  # 队友，每个由4维向量(相对x,y,相对vx,vy)表示
+  teammate_embed:  { dim: 4, num: 1 }
+
+  # a1，每个由4维向量(相对x,y,相对vx,vy)表示
+  opponent1_embed:  { dim: 4, num: 1 }
+  opponent2_embed:  { dim: 4, num: 1 }
   
   # 1个投篮点，由3维向量(相对x,y,is_in_spot)表示
   spot_embed:   { dim: 3, num: 1 }

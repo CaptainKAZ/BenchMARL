@@ -4,10 +4,11 @@
 name: attention
 embedding_dim: 64
 num_heads: 4
-num_attention_layers: 1
+num_attention_layers: 2
 ffn_multiplier: 4
 dropout_prob: 0
-final_mlp_hidden_layers: [64,64]
+final_mlp_hidden_layers: [128]
+use_ego_embedding: True
 
 # ==================================
 # 2. 输入数据结构定义
@@ -17,7 +18,9 @@ final_mlp_hidden_layers: [64,64]
 # 模型将严格按照这个列表的顺序来解析输入向量。
 # 你可以任意调整这里的顺序，只要它与环境输出的扁平向量一致。
 input_feature_order:
-  - agent_embed
+  - self_embed
+  - teammate_embed
+  - opponent_embed
   - spot_embed
   - basket_embed
   - time
@@ -27,7 +30,9 @@ input_feature_order:
 # 'global': 不进入注意力网络，在最后阶段融合，提供全局上下文。
 roles:
   entity:
-    - agent_embed
+    - self_embed
+    - teammate_embed
+    - opponent_embed
     - spot_embed
     - basket_embed
   global:
@@ -36,9 +41,14 @@ roles:
 # 2.3. 定义每个特征自身的属性
 # 格式: { dim: 每个单位的特征维度, num: 单位的数量 }
 definitions:
+  # 自身编码方式和队友对手的不一致
+  self_embed:   { dim: 4, num: 1 }
 
-  # 3个智能体 (队友, 对手1, 对手2)，每个由4维向量(相对x,y,相对vx,vy)表示
-  agent_embed:  { dim: 4, num: 4 }
+  # 队友，每个由4维向量(相对x,y,相对vx,vy)表示
+  teammate_embed:  { dim: 4, num: 1 }
+
+  # 两个对手，每个由4维向量(相对x,y,相对vx,vy)表示
+  opponent_embed:  { dim: 4, num: 2 }
   
   # 1个投篮点，由3维向量(相对x,y,is_in_spot)表示
   spot_embed:   { dim: 3, num: 1 }

@@ -7,7 +7,6 @@
 from dataclasses import dataclass, MISSING
 from typing import Dict, Iterable, Tuple, Type
 
-from sympy import true
 import torch
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModule, TensorDictSequential
