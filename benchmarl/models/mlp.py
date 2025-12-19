@@ -78,6 +78,8 @@ class Mlp(Model):
                 ]
             )
 
+        print(self.mlp)
+
     def _perform_checks(self):
         super()._perform_checks()
 

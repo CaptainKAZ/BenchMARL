@@ -6,10 +6,10 @@ n_layers: 1
 bias: True
 dropout: 0
 compile: True
-
+use_input_passthrough: True
 mlp_num_cells: [128,128]
 mlp_layer_class: torch.nn.Linear
-mlp_activation_class: torch.nn.Tanh
+mlp_activation_class: torch.nn.GELU
 mlp_activation_kwargs: null
 mlp_norm_class: torch.nn.LayerNorm
 mlp_norm_kwargs:

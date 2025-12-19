@@ -1,50 +1,85 @@
-# ==================================
-# 1. 模型结构超参数
-# ==================================
+# ==============================================================================
+# BenchMARL / TorchRL Attention Model Configuration
+# ==============================================================================
+
 name: attention
-embedding_dim: 64
-num_heads: 4
-num_attention_layers: 1
-ffn_multiplier: 4
-dropout_prob: 0
-final_mlp_hidden_layers: [64,64]
 
-# ==================================
-# 2. 输入数据结构定义
-# ==================================
+# ------------------------------------------------------------------------------
+# 1. 模型核心超参数 (Model Hyperparameters)
+# ------------------------------------------------------------------------------
+embedding_dim: 128          # 内部特征映射维度
+num_heads: 4                # 注意力头数
+num_attention_layers: 1     # Transformer 层数
+ffn_multiplier: 4           # FFN 隐藏层倍数 (128 * 4 = 512)
+dropout_prob: 0.0           # 强化学习建议设为 0，除非过拟合严重
+final_mlp_hidden_layers: [256,256] 
 
-# 2.1. 定义扁平向量中特征的实际排列顺序
-# 模型将严格按照这个列表的顺序来解析输入向量。
-# 你可以任意调整这里的顺序，只要它与环境输出的扁平向量一致。
+use_ego_embedding: False
+
+# ------------------------------------------------------------------------------
+# 2. 编码器分组策略 (Encoder Grouping Strategy) - 【核心改动】
+# ------------------------------------------------------------------------------
+# 这里定义哪些特征共享同一个 Linear 层 (参数共享)。
+# 只有物理维度相同、且逻辑相似的实体才应该放在一组。
+# 代码会自动为组内的特征拼接 One-Hot ID 以区分身份。
+
+encoder_groups:
+  # --- 组 1: 动态单位 (Players) ---
+  # 它们都是 4 维 (x, y, vx, vy)，物理规律一致。
+  # 共享同一个权重矩阵，利用 ID (0, 1, 2) 区分自我、队友、敌人。
+  players:
+    features:
+      - attacker1_embed
+      - attacker2_embed
+      - defender_embed
+
+# ------------------------------------------------------------------------------
+# 3. 忽略列表 (Ignore Features)
+# ------------------------------------------------------------------------------
+# 在这里列出的特征会被直接丢弃，不进入网络。
+# 适用于：全 0 的 Padding 数据、你不希望 Agent 看到的作弊数据等。
+ignore_features:
+  # - dummy_padding_zeros  # 示例：假设你有这个废弃特征
+
+# ------------------------------------------------------------------------------
+# 4. 输入特征解析 (Input Parsing)
+# ------------------------------------------------------------------------------
+
+# 4.1. 特征顺序
+# 【非常重要】如果 use_ego_embedding: True，请务必保证 'self_embed' 排在第一个！
+# 这样它才会对应 Sequence Index 0。
 input_feature_order:
-  - agent_embed
-  - spot_embed
-  - basket_embed
-  - time
+  - attacker1_embed   # -> Index 0
+  - attacker2_embed   # -> Index 1
+  - defender_embed    # -> Index 2, 3 (如果有2个对手)
+  - spot_embed        # -> Index 4
+  - basket_embed      # -> Index 5
+  - time              # -> Global
 
-# 2.2. 定义每个特征扮演的角色
-# 'entity': 其编码会进入自注意力网络，用于学习空间关系。
-# 'global': 不进入注意力网络，在最后阶段融合，提供全局上下文。
+# 4.2. 角色分配
 roles:
+  # 进入 Transformer 计算 Attention 关系的特征
   entity:
-    - agent_embed
+    - attacker1_embed
+    - attacker2_embed
+    - defender_embed
     - spot_embed
     - basket_embed
+  
+  # 不进入 Transformer，直接拼接到最后 MLP 的全局特征
   global:
     - time
 
-# 2.3. 定义每个特征自身的属性
-# 格式: { dim: 每个单位的特征维度, num: 单位的数量 }
+# 4.3. 维度定义 (必须与环境 Observation 一致)
 definitions:
+  # --- 组 1: Players (Raw Dim 必须一致，这里都是 4) ---
+  attacker1_embed:  { dim: 4, num: 1 }
+  attacker2_embed:  { dim: 4, num: 1 }
+  defender_embed:   { dim: 4, num: 2 } # 两个对手
 
-  # 3个智能体 (队友, 对手1, 对手2)，每个由4维向量(相对x,y,相对vx,vy)表示
-  agent_embed:  { dim: 4, num: 4 }
+  # --- 异构实体 (维度各不相同) ---
+  spot_embed:     { dim: 3, num: 1 } # x, y, is_active
+  basket_embed:   { dim: 2, num: 1 } # x, y
   
-  # 1个投篮点，由3维向量(相对x,y,is_in_spot)表示
-  spot_embed:   { dim: 3, num: 1 }
-
-  # 1个篮筐，由2维向量(相对x,y)表示
-  basket_embed: { dim: 2, num: 1 }
-
-  # 1个时间特征，由1维标量表示
-  time:         { dim: 1, num: 1 }
+  # --- 全局信息 ---
+  time:           { dim: 1, num: 1 }

@@ -19,6 +19,7 @@ from .lstm import Lstm, LstmConfig
 from .mlp import Mlp, MlpConfig
 from .gtrxl import GTrXL, GTrXLConfig
 from .attention import Attention,AttentionConfig
+from benchmarl.models.mamba import MambaConfig
 
 classes = [
     "Mlp",
@@ -34,7 +35,8 @@ classes = [
     "Lstm",
     "LstmConfig",
     "GTrXL",
-    "attention"
+    "attention",
+    "mamba"
 ]
 
 model_config_registry = {
@@ -45,5 +47,6 @@ model_config_registry = {
     "gru": GruConfig,
     "lstm": LstmConfig,
     "gtrxl": GTrXLConfig,
-    "attention": AttentionConfig
+    "attention": AttentionConfig,
+    "mamba": MambaConfig
 }

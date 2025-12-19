@@ -1,0 +1,17 @@
+name: mamba
+
+hidden_size: 64
+d_state: 64
+d_conv: 4
+expand: 2
+headdim: 64
+
+# 如果 Mamba 的输出维度不等于需要的输出维度（例如 Action dim），可以用 MLP 调整
+# 如果不需要 MLP，可以留空或设置合适的层
+mlp_num_cells: [64,64] 
+mlp_layer_class: torch.nn.Linear
+mlp_activation_class: torch.nn.Tanh
+mlp_activation_kwargs: null
+mlp_norm_class: torch.nn.LayerNorm
+mlp_norm_kwargs:
+  normalized_shape: 64

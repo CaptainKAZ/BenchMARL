@@ -1,6 +1,4 @@
-from sympy import im, true
 import torch
-from wandb import restore
 from benchmarl.algorithms import MappoConfig
 from benchmarl.algorithms import IppoConfig
 from benchmarl.environments import LayupTask # 替换为您重构后的新环境
@@ -9,6 +7,7 @@ from benchmarl.models.gru import GruConfig
 from benchmarl.models.gtrxl import GTrXLConfig
 from benchmarl.models.mlp import MlpConfig
 from benchmarl.models.attention import AttentionConfig
+from benchmarl.models.mamba import MambaConfig
 from benchmarl.experiment.callback import Callback
 from tensordict import TensorDict, TensorDictBase
 from typing import List, Set
@@ -161,6 +160,7 @@ class WinRateReport(Callback):
         # 这个变量将保存实验原始的训练组，以便我们恢复
         self.original_group_map = None
         print(f"[WinRateCurriculum] Callback initialized with threshold {self.win_rate_threshold}.")
+        
 
     def on_setup(self):
         """
@@ -195,13 +195,6 @@ class WinRateReport(Callback):
             # # 'done' 标志着一个回合的结束
             total_dones_in_batch = done_info.sum().item()
 
-            # # 课程学习，先学会进攻
-            # if "defender" in new_train_map:
-            #     del new_train_map["defender"]
-            # return
-
-            # # 计算在所有结束的回合中，由投篮导致的比率
-            # win_rate = total_shots_in_batch / total_dones_in_batch if total_dones_in_batch > 0 else 0.0
             print(f"Win rate: {win_rate:.2f}")
 
             if self.experiment.n_iters_performed < 20: #or self.experiment.n_iters_performed % 50 < 3:
@@ -234,6 +227,107 @@ class WinRateReport(Callback):
         # 下一个训练循环将只会遍历我们在这里设置的组。
         self.experiment.train_group_map = new_train_map
 
+class WinRateReportDebounced(Callback):
+    """
+    一个自定义回调，根据胜率动态调整训练的智能体组。
+    增加了防抖（滞后）机制：
+    1. 当胜率 < low_threshold (0.3) -> 进入进攻方特训，直到胜率回升至 recovery_threshold (0.5)。
+    2. 当胜率 > high_threshold (0.7) -> 进入防守方特训，直到胜率回落至 recovery_threshold (0.5)。
+    """
+    def __init__(self, win_rate_threshold: float = 0.4, recovery_threshold: float = 0.55):
+        self.win_rate_threshold = win_rate_threshold
+        self.high_threshold = 1.0 - win_rate_threshold
+        self.recovery_threshold = recovery_threshold
+        
+        # 状态变量：'normal', 'fix_attacker', 'fix_defender'
+        self.current_mode = 'fix_attacker' 
+        
+        self.original_group_map = None
+        print(f"[WinRateCurriculum] Callback initialized. Low: {self.win_rate_threshold}, High: {self.high_threshold}, Target: {self.recovery_threshold}")
+
+    def on_setup(self):
+        self.original_group_map = self.experiment.train_group_map.copy()
+        print(f"[WinRateCurriculum] Setup complete. Original training groups: {list(self.original_group_map.keys())}")
+
+    def on_batch_collected(self, batch: TensorDictBase):
+        # 默认基础是所有组
+        new_train_map = self.original_group_map.copy()
+
+        try:
+            # --- 1. 计算胜率逻辑 (保持你原有的逻辑不变) ---
+            done_info = batch.get(("next", "done"))
+            reason_codes_tensor = batch.get(("next", "attacker", "info", "termination_reason"))[...,0,:]
+            reason_codes = reason_codes_tensor.squeeze(-1)
+            dones_mask = done_info.squeeze(-1).bool()
+            terminated_codes_in_batch = reason_codes[dones_mask]
+            
+            # 假设 log_and_calculate_win_rate 是外部可用的函数
+            win_rate = log_and_calculate_win_rate(terminated_codes_in_batch, {1,2,3,4,5})
+            total_dones_in_batch = done_info.sum().item()
+
+            print(f"Win rate: {win_rate:.2f} | Current Mode: {self.current_mode}")
+
+            # 预热期不调整
+            if self.experiment.n_iters_performed < 20:
+                self.experiment.train_group_map = new_train_map
+                return
+            
+            # 如果没有结束的回合or数据不足，保持上一次的状态设置，直接返回
+            if total_dones_in_batch <= 1000:
+                # 保持当前的 train_group_map 不变 (或者沿用上一次的 new_train_map)
+                # 这里为了安全，我们重新应用基于当前 mode 的 map
+                self._apply_mode_to_map(new_train_map)
+                self.experiment.train_group_map = new_train_map
+                return
+
+            # --- 2. 状态机逻辑 (防抖核心) ---
+            
+            if self.current_mode == 'normal':
+                # 检查是否需要进入特训模式
+                if win_rate < self.win_rate_threshold:
+                    self.current_mode = 'fix_attacker'
+                    print(f"!!! Attacker is too weak ({win_rate:.2f} < {self.win_rate_threshold}). Locking training to ATTACKER.")
+                elif win_rate > self.high_threshold:
+                    self.current_mode = 'fix_defender'
+                    print(f"!!! Defender is too weak ({win_rate:.2f} > {self.high_threshold}). Locking training to DEFENDER.")
+            
+            elif self.current_mode == 'fix_attacker':
+                # 进攻方特训中：只有胜率回到 0.5 以上才解除
+                if win_rate >= self.recovery_threshold:
+                    self.current_mode = 'normal'
+                    print(f">>> Attacker recovered ({win_rate:.2f} >= {self.recovery_threshold}). Resuming NORMAL training.")
+                else:
+                    # 保持现状
+                    pass
+
+            elif self.current_mode == 'fix_defender':
+                # 防守方特训中：只有胜率(进攻方胜率)降回到 0.5 以下才解除
+                if win_rate <= (1 - self.recovery_threshold):
+                    self.current_mode = 'normal'
+                    print(f">>> Defender recovered ({win_rate:.2f} <= {1 - self.recovery_threshold}). Resuming NORMAL training.")
+                else:
+                    # 保持现状
+                    pass
+
+            # --- 3. 根据最终确定的 Mode 修改训练组 ---
+            self._apply_mode_to_map(new_train_map)
+
+        except (KeyError, AttributeError) as e:
+            print(f"\n[WinRateCurriculum] Error computing win rate ({e}). Defaulting to all groups.")
+            pass
+
+        # 更新实验设置
+        self.experiment.train_group_map = new_train_map
+
+    def _apply_mode_to_map(self, train_map):
+        """辅助函数：根据当前模式修改字典"""
+        if self.current_mode == 'fix_attacker':
+            if "defender" in train_map:
+                del train_map["defender"]
+        elif self.current_mode == 'fix_defender':
+            if "attacker" in train_map:
+                del train_map["attacker"]
+        # normal 模式下不删除任何键，保持默认
 
 # checkpoint_path = "outputs/2025-07-06_19-39-05/mappo_layup_gru__c217740f_25_07_06-19_39_05/checkpoints"
 checkpoint_pattern="outputs/**/checkpoints/*.pt"
@@ -241,19 +335,20 @@ checkpoint_pattern="outputs/**/checkpoints/*.pt"
 if __name__ == '__main__':
     # 1. 定义预训练模型的路径
     # restore_file_path = find_latest_file(checkpoint_path,"*.pt")
-    # restore_file_path = find_latest_checkpoint(checkpoint_pattern)
-    # print(f"found checkpoint: {restore_file_path}")
-    # if restore_file_path is None:
-    #     exit(1)
+    # torch.autograd.set_detect_anomaly(True)
+    restore_file_path = find_latest_checkpoint(checkpoint_pattern)
+    print(f"found checkpoint: {restore_file_path}")
+    if restore_file_path is None:
+        exit(1)
 
     # # # # 2. 加载检查点文件并只提取模型权重
     # print(f"Loading checkpoint from {restore_file_path}...")
     # checkpoint = torch.load(restore_file_path)
-    # # print_dict_paths(checkpoint)
+    # print_dict_paths(checkpoint)
     # print("Successfully extracted model weights.")
     # 3. 配置并创建新环境的实验
     experiment_config = ExperimentConfig.get_from_yaml()
-    # experiment_config.restore_file = restore_file_path
+    experiment_config.restore_file = restore_file_path
 
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S").replace(":", "-")
     folder_name= f"outputs/{current_time}"
@@ -266,29 +361,40 @@ if __name__ == '__main__':
     attacker_algorithm_config = MappoConfig.get_from_yaml()
     attacker_algorithm_config.share_param_actor = False
     defender_algorithm_config = MappoConfig.get_from_yaml()
-    attacker_algorithm_config.share_param_actor = True
+    defender_algorithm_config.share_param_actor = True
+    print(attacker_algorithm_config,defender_algorithm_config)
     algorithm_config = EnsembleAlgorithmConfig({"attacker":attacker_algorithm_config, "defender":defender_algorithm_config})
-    # algorithm_config = MappoConfig.get_from_yaml()
+    algorithm_config = MappoConfig.get_from_yaml()
     attacker_model_config = SequenceModelConfig(
         model_configs=[
             AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_attacker.yaml"),
             GruConfig.get_from_yaml(),
         ],
         intermediate_sizes=[
-            64
+            96
         ],  # Nuber of intermediate outputs. List of size n_layers - 1
     )
+    # attacker_model_config = AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_attacker.yaml")
     defender_model_config = SequenceModelConfig(
         model_configs=[
             AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_defender.yaml"),
             GruConfig.get_from_yaml(),
         ],
         intermediate_sizes=[
-            64
+            96
         ],  # Nuber of intermediate outputs. List of size n_layers - 1
     )
+    # defender_model_config = AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_defender.yaml")
     model_config = EnsembleModelConfig({"attacker":attacker_model_config, "defender":defender_model_config})
+    
     critic_model_config = AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_critic.yaml")
+    
+    # mamba
+    # model_config = MambaConfig.get_from_yaml()
+    
+    # basic: mlp
+    # model_config = MlpConfig.get_from_yaml()
+    # critic_model_config = model_config
 
         
 
@@ -300,14 +406,14 @@ if __name__ == '__main__':
         critic_model_config=critic_model_config,
         seed=114514,
         config=experiment_config,
-        callbacks=[WinRateReport()]
+        callbacks=[WinRateReportDebounced()]
     )
     print("New experiment created with fresh training states (optimizers, buffers, etc.).")
 
-    # 手动将预训练权重加载到新实验的模型中,actor和critic都恢复
-    # 遍历新实验中的每一个智能体组
+    # # 手动将预训练权重加载到新实验的模型中,actor和critic都恢复
+    # # 遍历新实验中的每一个智能体组
     # for group in experiment.group_map.keys():
-    #     if group == "attacker" or True:
+    #     if group == "attacker" :
     #         loss_key = f"loss_{group}"
     #         if loss_key in checkpoint:
     #             print(f"Loading weights for group '{group}' from '{loss_key}'...")
@@ -322,7 +428,7 @@ if __name__ == '__main__':
     # 只恢复 actor 网络不恢复 critic
     # ACTOR_PREFIX = "actor_network_params."
     # for group in experiment.group_map.keys():
-    #     if group == "defender" or True:
+    #     if group == "attacker" :
     #         loss_key = f"loss_{group}"
     #         if loss_key in checkpoint:
     #             print(f"Partially loading ONLY ACTOR weights for group '{group}'...")

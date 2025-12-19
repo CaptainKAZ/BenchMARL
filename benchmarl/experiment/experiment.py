@@ -708,21 +708,13 @@ class Experiment(CallbackNotifier):
         }
         self.optimizers = {
             group: {
-                loss_name: torch.optim.Adam(
-                    params, lr=self.config.lr, eps=self.config.adam_eps
+                loss_name: torch.optim.AdamW(
+                    params, lr=self.config.lr, eps=self.config.adam_eps, weight_decay=1e-4
                 )
                 for loss_name, params in self.algorithm.get_parameters(group).items()
             }
             for group in self.group_map.keys()
         }
-        if "cuda" in self.config.train_device:
-            self.cuda_streams = {
-                group: torch.cuda.Stream(device=self.config.train_device)
-                for group in self.group_map.keys()
-            }
-        else:
-            self.cuda_streams = None
-        self.scaler = torch.amp.GradScaler("cuda")
 
     def _setup_collector(self):
         self.policy = self.algorithm.get_policy_for_collection()
@@ -1070,40 +1062,25 @@ class Experiment(CallbackNotifier):
 
     def _optimizer_loop(self, group: str) -> TensorDictBase:
         subdata = self.replay_buffers[group].sample().to(self.config.train_device)
-
-        # 1. 使用 autocast 上下文包裹前向传播(损失计算)
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-            loss_vals = self.losses[group](subdata)
-
+        loss_vals = self.losses[group](subdata)
         training_td = loss_vals.detach()
         loss_vals = self.algorithm.process_loss_vals(group, loss_vals)
 
-        # 2. 修改循环内部的 backprop 和 step
         for loss_name, loss_value in loss_vals.items():
             if loss_name in self.optimizers[group].keys():
                 optimizer = self.optimizers[group][loss_name]
 
-                # 使用 scaler 来缩放损失并执行反向传播
-                self.scaler.scale(loss_value).backward()
+                loss_value.backward()
 
-                # --- 梯度裁剪部分保持不变 ---
-                # 注意：更精细的控制可能需要先 unscale 再裁剪，但对于大多数情况，
-                # 在 unscale 之前裁剪范数（clip_grad_norm_）是可接受的。
                 grad_norm = self._grad_clip(optimizer)
 
                 training_td.set(
                     f"grad_norm_{loss_name}",
                     torch.tensor(grad_norm, device=self.config.train_device),
                 )
-                # --- 梯度裁剪部分结束 ---
 
-                # scaler.step 会自动 unscale 梯度并执行优化器步骤
-                self.scaler.step(optimizer)
+                optimizer.step()
                 optimizer.zero_grad()
-        
-        # 3. 在所有优化器 step 完成后，更新 scaler
-        self.scaler.update()
-
         self.replay_buffers[group].update_tensordict_priority(subdata)
         if self.target_updaters[group] is not None:
             self.target_updaters[group].step()

@@ -24,6 +24,101 @@ from torchrl.objectives import ClipPPOLoss, LossModule, ValueEstimators
 from benchmarl.algorithms.common import Algorithm, AlgorithmConfig
 from benchmarl.models.common import ModelConfig
 
+import torch
+from tensordict import TensorDictBase
+
+def install_nan_hunter(model):
+    """
+    给模型的所有子层安装 NaN 监控钩子 (支持 TensorDict 和 Nested Structure)。
+    无需 autograd，在 inference/rollout 模式下完全有效。
+    """
+    
+    def _check_nan(data, location_name=""):
+        """
+        递归检查 data 中是否包含 NaN/Inf。
+        返回: (has_nan, details_string)
+        """
+        # 1. 如果是 TensorDict
+        if isinstance(data, TensorDictBase):
+            # 遍历所有叶子节点 (leaves_only=True 会自动递归嵌套的 TensorDict)
+            for key, val in data.items(include_nested=True, leaves_only=True):
+                if isinstance(val, torch.Tensor):
+                    if torch.isnan(val).any() or torch.isinf(val).any():
+                        return True, f"{location_name}[TensorDict Key: '{key}']"
+            return False, None
+
+        # 2. 如果是 Tensor
+        elif isinstance(data, torch.Tensor):
+            if torch.isnan(data).any() or torch.isinf(data).any():
+                return True, f"{location_name}[Tensor shape={data.shape}]"
+            return False, None
+
+        # 3. 如果是 Tuple 或 List
+        elif isinstance(data, (tuple, list)):
+            for i, item in enumerate(data):
+                found, msg = _check_nan(item, f"{location_name}[Seq index: {i}]")
+                if found:
+                    return True, msg
+            return False, None
+
+        # 4. 其他类型忽略 (如 None, int, str)
+        return False, None
+
+    def _print_stats(data, prefix=""):
+        """辅助函数：打印数据的统计信息"""
+        if isinstance(data, torch.Tensor):
+             print(f"{prefix} Tensor {data.shape}: Min={data.min():.4f}, Max={data.max():.4f}, Mean={data.mean():.4f}, HasNaN={torch.isnan(data).any()}")
+        elif isinstance(data, TensorDictBase):
+            print(f"{prefix} TensorDict Keys: {data.keys(include_nested=True)}")
+            # 简单打印第一个 key 的状态作为示例，防止刷屏
+            for key, val in data.items(include_nested=True, leaves_only=True):
+                 if isinstance(val, torch.Tensor):
+                    print(f"{prefix}   -> Key '{key}': Min={val.min():.4f}, Max={val.max():.4f}, HasNaN={torch.isnan(val).any()}")
+
+    def _hook(module, args, output):
+        # args 是输入 (tuple), output 是输出 (可以是 Tensor, TensorDict, Tuple 等)
+        
+        # --- 1. 检查输入 (Input) ---
+        # args 永远是一个 tuple，比如 (tensordict, ) 或者 (tensor_a, tensor_b)
+        for i, arg in enumerate(args):
+            has_nan, loc = _check_nan(arg, location_name=f"Input arg {i}")
+            if has_nan:
+                # 发现输入就有 NaN，通常意味着上一层或者是数据源的问题
+                # 我们可以选择忽略，或者打印警告
+                # print(f"⚠️ Warning: Layer {type(module).__name__} received NaN at {loc}")
+                pass 
+
+        # --- 2. 检查输出 (Output) ---
+        has_nan_out, loc_out = _check_nan(output, location_name="Output")
+
+        if has_nan_out:
+            print(f"\n{'='*60}")
+            print(f"🚨 抓到了！NaN 产生于层: {module}")
+            print(f"   类型: {type(module).__name__}")
+            print(f"   具体位置: {loc_out}")
+            print(f"{'='*60}")
+            
+            print("\n--- 🕵️‍♂️ 现场数据分析 ---")
+            
+            print("1. 输入数据统计:")
+            for i, arg in enumerate(args):
+                _print_stats(arg, prefix=f"Arg[{i}]:")
+
+            print("\n2. 输出数据统计:")
+            _print_stats(output, prefix="Output:")
+            
+            # 抛出异常，暂停程序
+            raise RuntimeError(f"NaN detected in forward pass of {type(module).__name__}")
+
+    # 递归注册到所有子模块
+    print(f"🕵️‍♂️ NaN Hunter (TensorDict版) 正在启动...")
+    for name, layer in model.named_modules():
+        # 我们可以跳过一些不进行计算的容器层，比如 Sequential，只监控实际的叶子层
+        # 但为了保险，监控所有层也行，除了本身就是容器的
+        if len(list(layer.children())) == 0: 
+            # print(f"  -> 监控层：{name} ({type(layer).__name__})")
+            layer.register_forward_hook(_hook)
+    print("✅ 监控已就绪。")
 
 class Mappo(Algorithm):
     """Multi Agent PPO (from `https://arxiv.org/abs/2103.01955 <https://arxiv.org/abs/2103.01955>`__).
@@ -88,7 +183,8 @@ class Mappo(Algorithm):
             entropy_coef=self.entropy_coef,
             critic_coef=self.critic_coef,
             loss_critic_type=self.loss_critic_type,
-            normalize_advantage=False,
+            # normalize_advantage=True,
+            # normalize_advantage_exclude_dims=[1]
         )
         loss_module.set_keys(
             reward=(group, "reward"),
@@ -136,6 +232,7 @@ class Mappo(Algorithm):
                 )
             }
         )
+        print(f"making actor model for {group}")
         actor_module = model_config.get_model(
             input_spec=actor_input_spec,
             output_spec=actor_output_spec,
@@ -147,10 +244,11 @@ class Mappo(Algorithm):
             device=self.device,
             action_spec=self.action_spec,
         )
+        print(actor_module)
 
         if continuous:
             extractor_module = TensorDictModule(
-                NormalParamExtractor(scale_mapping=self.scale_mapping),
+                NormalParamExtractor(scale_mapping=self.scale_mapping, scale_lb=1e-4),
                 in_keys=[(group, "logits")],
                 out_keys=[(group, "loc"), (group, "scale")],
             )
@@ -198,7 +296,8 @@ class Mappo(Algorithm):
                     return_log_prob=True,
                     log_prob_key=(group, "log_prob"),
                 )
-        policy=torch.compile(policy)
+        # policy=torch.compile(policy)
+        # install_nan_hunter(policy)
         return policy
 
     def _get_policy_for_collection(
@@ -296,7 +395,7 @@ class Mappo(Algorithm):
             critic_input_spec = Composite(
                 {group: self.observation_spec[group].clone().to(self.device)}
             )
-
+        print(f"making critic model for {group}")
         value_module = self.critic_model_config.get_model(
             input_spec=critic_input_spec,
             output_spec=critic_output_spec,
@@ -308,6 +407,7 @@ class Mappo(Algorithm):
             device=self.device,
             action_spec=self.action_spec,
         )
+        print(value_module)
         if self.share_param_critic:
             expand_module = TensorDictModule(
                 lambda value: value.unsqueeze(-2).expand(

@@ -29,7 +29,7 @@ adam_eps: 0.000001
 # Clips grad norm if true and clips grad value if false
 clip_grad_norm: True
 # The value for the clipping, if null no clipping
-clip_grad_val: 5
+clip_grad_val: 2.0
 
 # Whether to use soft or hard target updates
 soft_target_update: True
@@ -60,10 +60,10 @@ on_policy_collected_frames_per_batch: 150000
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
 on_policy_n_envs_per_worker: 7500
 # This is the number of times collected_frames_per_batch will be split into minibatches and trained
-on_policy_n_minibatch_iters: 30
+on_policy_n_minibatch_iters: 15
 # In on-policy algorithms the train_batch_size will be equal to the on_policy_collected_frames_per_batch
 # and it will be split into minibatches with this number of frames for training
-on_policy_minibatch_size: 25000
+on_policy_minibatch_size: 50000
 
 # Number of frames collected and each experiment iteration
 off_policy_collected_frames_per_batch: 81920

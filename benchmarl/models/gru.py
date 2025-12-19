@@ -281,20 +281,14 @@ class Gru(Model):
 
     Where `F` is the number of features. These arrays will be concatenated along the F dimensions,
     which will be processed to features of `hidden_size` by the GRU.
-
+    
     Args:
         hidden_size (int): The number of features in the hidden state.
-        num_layers (int): Number of recurrent layers. E.g., setting ``num_layers=2``
-            would mean stacking two GRUs together to form a `stacked GRU`,
-            with the second GRU taking in outputs of the first GRU and
-            computing the final results. Default: 1
+        num_layers (int): Number of recurrent layers.
         bias (bool): If ``False``, then the GRU layers do not use bias.
-            Default: ``True``
-        dropout (float): If non-zero, introduces a `Dropout` layer on the outputs of each
-            GRU layer except the last layer, with dropout probability equal to
-            :attr:`dropout`. Default: 0
-        compile (bool): If ``True``, compiles underlying gru model. Default: ``False``
-
+        dropout (float): If non-zero, introduces a `Dropout` layer.
+        compile (bool): If ``True``, compiles underlying gru model.
+        use_input_passthrough (bool): If ``True``, concatenates raw input with GRU output before MLP.
     """
 
     def __init__(
@@ -304,6 +298,7 @@ class Gru(Model):
         bias: bool,
         dropout: float,
         compile: bool,
+        use_input_passthrough: bool, # <--- 接收新参数
         **kwargs,
     ):
 
@@ -330,6 +325,7 @@ class Gru(Model):
         self.bias = bias
         self.dropout = dropout
         self.compile = compile
+        self.use_input_passthrough = use_input_passthrough # <--- 保存配置
 
         self.input_features = sum(
             [spec.shape[-1] for spec in self.input_spec.values(True, True)]
@@ -365,14 +361,23 @@ class Gru(Model):
                 ]
             )
 
+        # 【核心逻辑】：根据配置决定 MLP 的输入维度
+        if self.use_input_passthrough:
+            # 开启时：MLP 输入 = GRU输出(hidden_size) + 原始输入(input_features)
+            mlp_input_dim = self.hidden_size + self.input_features
+        else:
+            # 关闭时：MLP 输入 = GRU输出(hidden_size)
+            mlp_input_dim = self.hidden_size
+
         mlp_net_kwargs = {
             "_".join(k.split("_")[1:]): v
             for k, v in kwargs.items()
             if k.startswith("mlp_")
         }
+        
         if self.output_has_agent_dim:
             self.mlp = MultiAgentMLP(
-                n_agent_inputs=self.hidden_size,
+                n_agent_inputs=mlp_input_dim, # 使用动态计算的维度
                 n_agent_outputs=self.output_features,
                 n_agents=self.n_agents,
                 centralised=self.centralised,
@@ -384,7 +389,7 @@ class Gru(Model):
             self.mlp = nn.ModuleList(
                 [
                     MLP(
-                        in_features=self.hidden_size,
+                        in_features=mlp_input_dim, # 使用动态计算的维度
                         out_features=self.output_features,
                         device=self.device,
                         **mlp_net_kwargs,
@@ -467,6 +472,20 @@ class Gru(Model):
                     outputs.append(output)
                 output = torch.stack(outputs, dim=-2)
 
+        # 【核心逻辑】：执行直通拼接 (Passthrough Concatenation)
+        if self.use_input_passthrough:
+            # 这里的 output 是 GRU 的输出
+            # input 是原始特征
+            
+            # 兼容性处理：如果 GRU 的 output 丢弃了 Agent 维度 (例如某些 Critic 场景)，
+            # 原始 input 也需要对应切片才能拼接。
+            input_for_mlp = input
+            if self.input_has_agent_dim and not self.output_has_agent_dim:
+                 input_for_mlp = input[..., 0, :]
+            
+            # 沿着特征维度拼接
+            output = torch.cat([output, input_for_mlp], dim=-1)
+
         # Mlp
         if self.output_has_agent_dim:
             output = self.mlp.forward(output)
@@ -494,6 +513,9 @@ class GruConfig(ModelConfig):
     bias: bool = MISSING
     dropout: float = MISSING
     compile: bool = MISSING
+    
+    # 【新增配置类字段】
+    use_input_passthrough: bool = MISSING
 
     mlp_num_cells: Sequence[int] = MISSING
     mlp_layer_class: Type[nn.Module] = MISSING
