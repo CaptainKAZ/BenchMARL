@@ -141,7 +141,7 @@ class Model(TensorDictModuleBase, ABC):
             )
 
         if len(self.out_keys) > 1:
-            raise ValueError("Currently models support just one output key")
+            raise ValueError(f"Currently models support just one output key {self.out_keys}")
 
         if self.agent_group in self.input_spec.keys() and self.input_spec[
             self.agent_group

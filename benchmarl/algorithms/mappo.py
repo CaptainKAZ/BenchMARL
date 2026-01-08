@@ -24,6 +24,10 @@ from torchrl.objectives import ClipPPOLoss, LossModule, ValueEstimators
 from benchmarl.algorithms.common import Algorithm, AlgorithmConfig
 from benchmarl.models.common import ModelConfig
 
+import functools
+from torchrl.data import CompositeSpec, BoundedTensorSpec, UnboundedContinuousTensorSpec, OneHotDiscreteTensorSpec, DiscreteTensorSpec
+from tensordict.nn import CompositeDistribution
+
 import torch
 from tensordict import TensorDictBase
 
@@ -206,11 +210,222 @@ class Mappo(Algorithm):
             "loss_objective": list(loss.actor_network_params.flatten_keys().values()),
             "loss_critic": list(loss.critic_network_params.flatten_keys().values()),
         }
+    
+    def _check_specs(self) -> None:
+        """
+        [关键修复] 覆盖父类检查。
+        允许 'action' 为 CompositeSpec (混合动作容器)，而不是强制要求为叶子节点。
+        """
+        for group in self.group_map.keys():
+            try:
+                group_spec = self.action_spec[group]
+            except KeyError:
+                raise ValueError(f"Action spec for group '{group}' is missing.")
+
+            if "action" not in group_spec.keys():
+                raise ValueError(
+                    f"Action spec for group '{group}' must contain an entry named 'action'."
+                )
+
+            action_spec = group_spec["action"]
+            
+            # 如果是混合动作容器，直接通过
+            if isinstance(action_spec, CompositeSpec):
+                continue 
+            
+            # 兼容旧逻辑：如果是普通 Spec，检查是否有 shape
+            if not hasattr(action_spec, "shape"):
+                 raise ValueError(f"Action spec for group '{group}' is invalid.")
+
+    def _get_composite_policy(self, group, model_config, n_agents, action_spec):
+        import functools
+        import torch  # [关键] 引入 torch 以使用 compiler 装饰器
+        from torch import distributions as d
+        from tensordict import TensorDict
+        from tensordict.nn import CompositeDistribution, TensorDictSequential, TensorDictModule
+        from torchrl.data import CompositeSpec
+        from torchrl.modules import IndependentNormal, TanhNormal, MaskedCategorical
+
+        # --- 1. 优化后的 Wrapper (带 Torch Compile Fix) ---
+
+        # [关键修复] 添加 @torch.compiler.disable
+        # 这个装饰器告诉 PyTorch Dynamo 不要尝试编译/追踪这个类及其方法。
+        # 这解决了由于 Categorical 分布惰性属性 (lazy properties) 和 __getattr__ 代理
+        # 导致的 "AssertionError: Guard check failed" 问题。
+        @torch.compiler.disable
+        class SummedDistributionWrapper(d.Distribution):
+            def __init__(self, dist, group_name):
+                self.dist = dist
+                self.group_name = group_name
+                
+            def log_prob(self, value):
+                # 1. 重构层级结构 (Hierarchy Reconstruction)
+                if isinstance(value, TensorDict):
+                    # 保持 batch_size 和 device 一致
+                    root = TensorDict({}, batch_size=value.batch_size, device=value.device)
+                    # 嵌套挂载：root -> group -> action -> values
+                    root[self.group_name] = TensorDict({"action": value}, batch_size=value.batch_size, device=value.device)
+                    lp = self.dist.log_prob(root)
+                else:
+                    lp = self.dist.log_prob(value)
+
+                # 2. 扁平化高效求和 (Flattened Sum)
+                if isinstance(lp, (dict, TensorDict)):
+                    # include_nested=True: 穿透所有层级
+                    # leaves_only=True: 只返回 Tensor
+                    leaves = list(lp.values(include_nested=True, leaves_only=True))
+                    
+                    if not leaves:
+                        return 0.0
+                    
+                    return sum(leaves)
+                
+                return lp
+
+            # 透传 entropy
+            def entropy(self):
+                ent = self.dist.entropy()
+                if isinstance(ent, (dict, TensorDict)):
+                    leaves = ent.values(include_nested=True, leaves_only=True)
+                    return sum(leaves)
+                return ent
+            
+            # 透传 sample
+            def sample(self, *args, **kwargs):
+                return self.dist.sample(*args, **kwargs)
+                
+            @property
+            def mode(self):
+                return self.dist.mode
+            
+            def __getattr__(self, name):
+                return getattr(self.dist, name)
+
+        class CompositePolicy(TensorDictSequential):
+            def __init__(self, prob_actor, summer, group_name):
+                super().__init__(prob_actor, summer)
+                self.prob_actor = prob_actor
+                self.group_name = group_name
+                
+            def get_dist(self, td, **kwargs):
+                if self.prob_actor:
+                    dist = self.prob_actor.get_dist(td, **kwargs)
+                    return SummedDistributionWrapper(dist, self.group_name)
+                raise RuntimeError("ProbabilisticActor not found in CompositePolicy sequence")
+
+        # --- 2. 配置准备 ---
+
+        distribution_map = {}
+        name_map = {} 
+        modules = []
+        flat_action_spec_dict = {}
+
+        total_param_dim = 0
+        split_sizes = []
+        split_names = []
+        
+        log_prob_keys = []
+        
+        for name, sub_spec in action_spec.items():
+            # 全局路径 (用于 Sampling)
+            full_action_key = (group, "action", name)
+            name_map[name] = full_action_key
+            flat_action_spec_dict[full_action_key] = sub_spec
+            
+            # log_prob 路径 (用于 Collection Summer)
+            # TorchRL 默认规则: action_key + "_log_prob"
+            lp_key = (group, "action", name + "_log_prob")
+            log_prob_keys.append(lp_key)
+
+            if isinstance(sub_spec, (BoundedTensorSpec, UnboundedContinuousTensorSpec)):
+                dim = sub_spec.shape[-1] * 2 
+                distribution_map[name] = IndependentNormal if not self.use_tanh_normal else TanhNormal
+            else:
+                dim = sub_spec.space.n
+                distribution_map[name] = Categorical if self.action_mask_spec is None else MaskedCategorical
+            
+            total_param_dim += dim
+            split_sizes.append(dim)
+            split_names.append(name)
+
+        # --- 3. 模块构建 ---
+
+        # (A) Base Model
+        actor_input_spec = Composite({group: self.observation_spec[group].clone().to(self.device)})
+        actor_output_spec = Composite({group: Composite({"logits": Unbounded(shape=(n_agents, total_param_dim))}, shape=(n_agents,))})
+        
+        base_model = model_config.get_model(
+            input_spec=actor_input_spec, output_spec=actor_output_spec, 
+            agent_group=group, input_has_agent_dim=True, n_agents=n_agents, 
+            centralised=False, share_params=self.experiment_config.share_policy_params, 
+            device=self.device, action_spec=self.action_spec
+        )
+        modules.append(base_model)
+
+        # (B) Splitter
+        split_keys = [f"{name}_raw_params" for name in split_names]
+        modules.append(TensorDictModule(
+            lambda x: torch.split(x, split_sizes, dim=-1),
+            in_keys=[(group, "logits")],
+            out_keys=split_keys
+        ))
+
+        # (C) Param Extractor
+        for name, sub_spec in action_spec.items():
+            raw_key = f"{name}_raw_params"
+            if isinstance(sub_spec, (BoundedTensorSpec, UnboundedContinuousTensorSpec)):
+                loc_key = (group, "params", name, "loc")
+                scale_key = (group, "params", name, "scale")
+                modules.append(TensorDictModule(
+                    NormalParamExtractor(scale_mapping=self.scale_mapping),
+                    in_keys=[raw_key],
+                    out_keys=[loc_key, scale_key]
+                ))
+            else:
+                logits_key = (group, "params", name, "logits")
+                modules.append(TensorDictModule(
+                    lambda x: x, in_keys=[raw_key], out_keys=[logits_key]
+                ))
+
+        # --- 4. ProbabilisticActor ---
+
+        dist_constructor = functools.partial(
+            CompositeDistribution,
+            distribution_map=distribution_map,
+            name_map=name_map
+        )
+        
+        check_spec = CompositeSpec(flat_action_spec_dict, shape=action_spec.shape)
+
+        prob_actor = ProbabilisticActor(
+            module=TensorDictSequential(*modules),
+            spec=check_spec,
+            in_keys=[(group, "params")],
+            out_keys=list(name_map.values()),
+            distribution_class=dist_constructor,
+            return_log_prob=True,
+            log_prob_keys=log_prob_keys, 
+        )
+        
+        # --- 5. Summer (用于 Collection 阶段) ---
+        
+        summer = TensorDictModule(
+            lambda *args: sum(args),
+            in_keys=log_prob_keys,
+            out_keys=[(group, "log_prob")]
+        )
+        
+        # --- 6. 返回策略 ---
+        return CompositePolicy(prob_actor, summer, group)
 
     def _get_policy_for_loss(
         self, group: str, model_config: ModelConfig, continuous: bool
     ) -> TensorDictModule:
         n_agents = len(self.group_map[group])
+        action_spec = self.action_spec[group, "action"]
+        if isinstance(action_spec, CompositeSpec):
+            return self._get_composite_policy(group, model_config, n_agents, action_spec)
+
         if continuous:
             logits_shape = list(self.action_spec[group, "action"].shape)
             logits_shape[-1] *= 2

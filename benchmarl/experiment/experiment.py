@@ -48,6 +48,7 @@ from benchmarl.utils import (
 import multiprocessing
 from torch.profiler import profile, record_function, ProfilerActivity
 from torch.cuda.amp import GradScaler, autocast
+from tensordict.nn import set_composite_lp_aggregate
 
 _has_hydra = importlib.util.find_spec("hydra") is not None
 if _has_hydra:
@@ -567,6 +568,7 @@ class Experiment(CallbackNotifier):
         return self.algorithm_config.on_policy()
 
     def _setup(self):
+        set_composite_lp_aggregate(False).set()
         self.config.validate(self.on_policy)
         seed_everything(self.seed)
         self._perform_checks()
@@ -721,9 +723,34 @@ class Experiment(CallbackNotifier):
 
         self.group_policies = {}
         for group in self.group_map.keys():
-            group_policy = self.policy.select_subsequence(out_keys=[(group, "action")])
-            assert len(group_policy) == 1
-            self.group_policies.update({group: group_policy[0]})
+            # [修改开始] 支持复合动作键查找
+            # 原代码: group_policy = self.policy.select_subsequence(out_keys=[(group, "action")])
+            
+            target_keys = [(group, "action")]
+            # 检查策略是否输出了更具体的子动作键 (e.g., ("agent", "action", "continuous"))
+            # select_subsequence 需要精确匹配 out_keys
+            if hasattr(self.policy, "out_keys"):
+                policy_out_keys = self.policy.out_keys
+                # 寻找所有以此 group action 为前缀的键
+                specific_keys = []
+                for key in policy_out_keys:
+                    # key 可能是字符串或元组，统一处理
+                    key_tuple = (key,) if isinstance(key, str) else key
+                    if len(key_tuple) > 2 and key_tuple[0] == group and key_tuple[1] == "action":
+                        specific_keys.append(key)
+                
+                if specific_keys:
+                    target_keys = specific_keys
+
+            group_policy = self.policy.select_subsequence(out_keys=target_keys)
+            
+            # [修改] 移除长度断言，支持多模块序列
+            # assert len(group_policy) == 1
+            
+            # [修改] 存储整个序列，而不是只取第一个元素 [0]
+            # 这样后续的 exploration check (explore_layer = group_policy[-1]) 才能正确获取到最后的 Actor
+            self.group_policies.update({group: group_policy})
+            # [修改结束]
 
         if not self.config.collect_with_grad:
             if self.config.n_workers != 1:

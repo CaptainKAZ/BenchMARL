@@ -240,7 +240,7 @@ class WinRateReportDebounced(Callback):
         self.recovery_threshold = recovery_threshold
         
         # 状态变量：'normal', 'fix_attacker', 'fix_defender'
-        self.current_mode = 'fix_attacker' 
+        self.current_mode = 'normal' 
         
         self.original_group_map = None
         print(f"[WinRateCurriculum] Callback initialized. Low: {self.win_rate_threshold}, High: {self.high_threshold}, Target: {self.recovery_threshold}")
@@ -329,6 +329,8 @@ class WinRateReportDebounced(Callback):
                 del train_map["attacker"]
         # normal 模式下不删除任何键，保持默认
 
+from health_check import HealthCheckCallback
+
 # checkpoint_path = "outputs/2025-07-06_19-39-05/mappo_layup_gru__c217740f_25_07_06-19_39_05/checkpoints"
 checkpoint_pattern="outputs/**/checkpoints/*.pt"
 
@@ -336,10 +338,10 @@ if __name__ == '__main__':
     # 1. 定义预训练模型的路径
     # restore_file_path = find_latest_file(checkpoint_path,"*.pt")
     # torch.autograd.set_detect_anomaly(True)
-    restore_file_path = find_latest_checkpoint(checkpoint_pattern)
-    print(f"found checkpoint: {restore_file_path}")
-    if restore_file_path is None:
-        exit(1)
+    # restore_file_path = find_latest_checkpoint(checkpoint_pattern)
+    # print(f"found checkpoint: {restore_file_path}")
+    # if restore_file_path is None:
+    #     exit(1)
 
     # # # # 2. 加载检查点文件并只提取模型权重
     # print(f"Loading checkpoint from {restore_file_path}...")
@@ -348,7 +350,7 @@ if __name__ == '__main__':
     # print("Successfully extracted model weights.")
     # 3. 配置并创建新环境的实验
     experiment_config = ExperimentConfig.get_from_yaml()
-    experiment_config.restore_file = restore_file_path
+    # experiment_config.restore_file = restore_file_path
 
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S").replace(":", "-")
     folder_name= f"outputs/{current_time}"
@@ -386,7 +388,6 @@ if __name__ == '__main__':
     )
     # defender_model_config = AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_defender.yaml")
     model_config = EnsembleModelConfig({"attacker":attacker_model_config, "defender":defender_model_config})
-    
     critic_model_config = AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_critic.yaml")
     
     # mamba
@@ -406,7 +407,7 @@ if __name__ == '__main__':
         critic_model_config=critic_model_config,
         seed=114514,
         config=experiment_config,
-        callbacks=[WinRateReportDebounced()]
+        callbacks=[WinRateReportDebounced(),HealthCheckCallback()]
     )
     print("New experiment created with fresh training states (optimizers, buffers, etc.).")
 
