@@ -357,7 +357,7 @@ class Mappo(Algorithm):
         base_model = model_config.get_model(
             input_spec=actor_input_spec, output_spec=actor_output_spec, 
             agent_group=group, input_has_agent_dim=True, n_agents=n_agents, 
-            centralised=False, share_params=self.experiment_config.share_policy_params, 
+            centralised=False, share_params=self.share_param_actor, 
             device=self.device, action_spec=self.action_spec
         )
         modules.append(base_model)

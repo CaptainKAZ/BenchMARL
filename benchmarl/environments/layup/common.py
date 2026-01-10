@@ -205,7 +205,7 @@ class LayupClass(TaskClass):
             )
             return env
 
-        return transformed_env_fun
+        return base_env_fun
 
     def supports_continuous_actions(self) -> bool:
         return True

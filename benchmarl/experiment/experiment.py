@@ -466,7 +466,7 @@ def _run_evaluation_process(
                             policy=eval_policy,
                             callback=callback if eval_episode == 0 else None,
                             auto_cast_to_device=True,
-                            break_when_any_done=True,
+                            break_when_any_done=False,
                         )
                     )
             else:

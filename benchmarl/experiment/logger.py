@@ -256,7 +256,7 @@ class Logger:
             ).unsqueeze(0)
             for logger in self.loggers:
                 if isinstance(logger, WandbLogger):
-                    logger.log_video("eval/video", vid, fps=20, commit=False)
+                    logger.log_video("eval/video", vid, fps=10, commit=False)
                 else:
                     # Other loggers cannot deal with odd video sizes so we check if the video dimensions are odd and make them even
                     for index in (-1, -2):

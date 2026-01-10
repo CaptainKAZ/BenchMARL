@@ -234,7 +234,7 @@ class WinRateReportDebounced(Callback):
     1. 当胜率 < low_threshold (0.3) -> 进入进攻方特训，直到胜率回升至 recovery_threshold (0.5)。
     2. 当胜率 > high_threshold (0.7) -> 进入防守方特训，直到胜率回落至 recovery_threshold (0.5)。
     """
-    def __init__(self, win_rate_threshold: float = 0.4, recovery_threshold: float = 0.55):
+    def __init__(self, win_rate_threshold: float = 0.35, recovery_threshold: float = 0.52):
         self.win_rate_threshold = win_rate_threshold
         self.high_threshold = 1.0 - win_rate_threshold
         self.recovery_threshold = recovery_threshold
@@ -338,10 +338,10 @@ if __name__ == '__main__':
     # 1. 定义预训练模型的路径
     # restore_file_path = find_latest_file(checkpoint_path,"*.pt")
     # torch.autograd.set_detect_anomaly(True)
-    # restore_file_path = find_latest_checkpoint(checkpoint_pattern)
-    # print(f"found checkpoint: {restore_file_path}")
-    # if restore_file_path is None:
-    #     exit(1)
+    restore_file_path = find_latest_checkpoint(checkpoint_pattern)
+    print(f"found checkpoint: {restore_file_path}")
+    if restore_file_path is None:
+        exit(1)
 
     # # # # 2. 加载检查点文件并只提取模型权重
     # print(f"Loading checkpoint from {restore_file_path}...")
@@ -350,7 +350,7 @@ if __name__ == '__main__':
     # print("Successfully extracted model weights.")
     # 3. 配置并创建新环境的实验
     experiment_config = ExperimentConfig.get_from_yaml()
-    # experiment_config.restore_file = restore_file_path
+    experiment_config.restore_file = restore_file_path
 
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S").replace(":", "-")
     folder_name= f"outputs/{current_time}"
@@ -362,8 +362,10 @@ if __name__ == '__main__':
 
     attacker_algorithm_config = MappoConfig.get_from_yaml()
     attacker_algorithm_config.share_param_actor = False
+    # attacker_algorithm_config.share_param_critic = False
     defender_algorithm_config = MappoConfig.get_from_yaml()
     defender_algorithm_config.share_param_actor = True
+    # defender_algorithm_config.share_param_critic = True
     print(attacker_algorithm_config,defender_algorithm_config)
     algorithm_config = EnsembleAlgorithmConfig({"attacker":attacker_algorithm_config, "defender":defender_algorithm_config})
     algorithm_config = MappoConfig.get_from_yaml()
