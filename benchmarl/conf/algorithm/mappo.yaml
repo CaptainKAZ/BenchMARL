@@ -6,10 +6,10 @@ defaults:
 
 share_param_critic: True
 clip_epsilon: 0.2
-entropy_coef: 0.08
-critic_coef: 1.5
+entropy_coef: 0.05
+critic_coef: 1.1
 loss_critic_type: "smooth_l1"
-lmbda: 0.9
+lmbda: 0.95
 scale_mapping: "biased_softplus_1.0"
 use_tanh_normal: True
 minibatch_advantage: True

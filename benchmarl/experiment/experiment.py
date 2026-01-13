@@ -322,7 +322,9 @@ class ExperimentConfig:
             )
 
 
-def _run_evaluation_process(
+def _evaluation_worker(
+    stop_event,
+    weight_queue,
     experiment_config: ExperimentConfig,
     algorithm_config: AlgorithmConfig,
     model_config: ModelConfig,
@@ -331,27 +333,20 @@ def _run_evaluation_process(
     group_map: Dict,
     seed: int,
     continuous_actions: bool,
-    policy_state_dict: Dict,
-    total_frames: int,
-    n_iters_performed: int,
     experiment_name: str,
     folder_name: Path,
 ):
     """
-    This function is designed to be run in a separate process for evaluation.
-    It rebuilds all necessary components on the specified evaluation device.
+    持久化评估工作进程。
+    仅初始化一次环境和算法，通过队列接收新权重进行评估。
     """
-    # ====================================================================
-    # 1. SETUP: Set device and seed for this independent process
-    # ====================================================================
-    eval_device = experiment_config.evaluation_device
+    # 强制使用 CPU
+    eval_device = torch.device("cpu")
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
     seed_everything(seed)
-    print(f"[Eval Process]: Starting evaluation on device '{eval_device}'.")
-
-    # ====================================================================
-    # 2. REBUILD ENVIRONMENT AND GET SPECS *FIRST*
-    # ====================================================================
-    # We must create the environment first to get its specifications.
+    
+    # --- 1. 初始化阶段 (仅执行一次) ---
+    # 创建环境
     test_env = task.get_env_fun(
         num_envs=experiment_config.evaluation_episodes,
         continuous_actions=continuous_actions,
@@ -359,27 +354,14 @@ def _run_evaluation_process(
         device=eval_device,
     )()
     
-    # Get all specs from the created environment
+    # 提取 Specs
     observation_spec = task.observation_spec(test_env)
     action_spec = task.action_spec(test_env)
     info_spec = task.info_spec(test_env)
     state_spec = task.state_spec(test_env)
     action_mask_spec = task.action_mask_spec(test_env)
 
-    # ====================================================================
-    # 3. REBUILD ALGORITHM and OTHER COMPONENTS
-    # ====================================================================
-
-    # try:
-    #     algorithm_config.device = eval_device
-    #     # 对于一些复杂的配置对象，可能需要更深层次的修改
-    #     # 例如 algorithm_config.config.train.device = eval_device
-    #     # 具体路径取决于您的 AlgorithmConfig 结构
-    #     print(f"[Eval Process]: Forced algorithm_config's device to '{eval_device}'.")
-    # except Exception as e:
-    #     print(f"[Eval Process]: Warning - could not force algorithm_config device: {e}")
-
-    # Now, create a more complete shell that includes the specs
+    # 伪造一个实验壳用于初始化算法
     class ExperimentShell:
         def __init__(self):
             self.config = experiment_config
@@ -391,8 +373,6 @@ def _run_evaluation_process(
             self.continuous_actions = continuous_actions
             self.seed = seed
             self.on_policy = self.algorithm_config.on_policy()
-
-            # Pass the retrieved specs
             self.observation_spec = observation_spec
             self.action_spec = action_spec
             self.info_spec = info_spec
@@ -401,29 +381,17 @@ def _run_evaluation_process(
 
     exp_shell = ExperimentShell()
     algorithm = algorithm_config.get_algorithm(exp_shell)
+    algorithm.device = torch.device("cpu")
 
-    # Now that the algorithm is created, we can finish setting up the env
+    # 环境转换
     transforms_env = Compose(*task.get_env_transforms(test_env))
     test_env = TransformedEnv(test_env, transforms_env.clone()).to(eval_device)
     if model_config.is_rnn:
         test_env = _add_rnn_transforms(lambda: test_env, group_map, model_config)()
     test_env = algorithm.process_env_fun(lambda: test_env)()
 
-    if experiment_config.evaluation_static:
-        try:
-            test_env.set_seed(seed)
-        except NotImplementedError:
-            warnings.warn(
-                "`experiment.evaluation_static` set to true but the environment does not allow to set seeds."
-            )
-
-    # Rebuild the policy on the correct device and load its weights
-    eval_policy = algorithm.get_policy_for_collection()
-    eval_policy.to(eval_device)
-    eval_policy.load_state_dict(policy_state_dict)
-    eval_policy.eval()
-
-    # Rebuild a logger instance
+    # 初始化策略和 Logger
+    eval_policy = algorithm.get_policy_for_collection().to(eval_device)
     logger = Logger(
         experiment_name=experiment_name,
         folder_name=str(folder_name),
@@ -438,63 +406,66 @@ def _run_evaluation_process(
         wandb_extra_kwargs=experiment_config.wandb_extra_kwargs,
     )
 
-    # ====================================================================
-    # 4. RUN ROLLOUTS: Perform the evaluation
-    # ====================================================================
-    evaluation_start = time.time()
-    
-    with torch.no_grad():
-        with set_exploration_type(
-            ExplorationType.DETERMINISTIC
-            if experiment_config.evaluation_deterministic_actions
-            else ExplorationType.RANDOM
-        ):
-            if task.has_render(test_env) and experiment_config.render:
-                video_frames = []
-                def callback(env, td):
-                    video_frames.append(task.__class__.render_callback(exp_shell, env, td))
-            else:
-                video_frames = None
-                callback = None
+    max_steps = task.max_steps(test_env)
 
-            if test_env.batch_size == ():
-                rollouts = []
-                for eval_episode in range(experiment_config.evaluation_episodes):
-                    rollouts.append(
-                        test_env.rollout(
-                            max_steps=task.max_steps(test_env),
-                            policy=eval_policy,
-                            callback=callback if eval_episode == 0 else None,
-                            auto_cast_to_device=True,
-                            break_when_any_done=False,
+    # --- 2. 循环监听阶段 ---
+    while not stop_event.is_set():
+        try:
+            # 尝试获取新权重，设置超时以便检查 stop_event
+            data = weight_queue.get(timeout=1.0)
+            if data is None: break  # 收到结束信号
+            
+            policy_state_dict, total_frames, n_iters_performed = data
+            
+            # 更新权重
+            eval_policy.load_state_dict(policy_state_dict)
+            eval_policy.eval()
+
+            # 运行评估 Rollouts
+            evaluation_start = time.time()
+            with torch.no_grad():
+                with set_exploration_type(
+                    ExplorationType.DETERMINISTIC
+                    if experiment_config.evaluation_deterministic_actions
+                    else ExplorationType.RANDOM
+                ):
+                    # 渲染回调处理
+                    if task.has_render(test_env) and experiment_config.render:
+                        video_frames = []
+                        def callback(env, td):
+                            video_frames.append(task.__class__.render_callback(exp_shell, env, td))
+                    else:
+                        video_frames = None
+                        callback = None
+
+                    # 执行 Rollout
+                    if test_env.batch_size == ():
+                        rollouts = []
+                        for eval_episode in range(experiment_config.evaluation_episodes):
+                            rollouts.append(test_env.rollout(
+                                max_steps=max_steps, policy=eval_policy,
+                                callback=callback if eval_episode == 0 else None,
+                                auto_cast_to_device=True, break_when_any_done=False,
+                            ))
+                    else:
+                        rollouts = test_env.rollout(
+                            max_steps=max_steps, policy=eval_policy,
+                            callback=callback, auto_cast_to_device=True, break_when_any_done=False,
                         )
-                    )
-            else:
-                rollouts = test_env.rollout(
-                    max_steps=task.max_steps(test_env),
-                    policy=eval_policy,
-                    callback=callback,
-                    auto_cast_to_device=True,
-                    break_when_any_done=False,
-                )
-                rollouts = list(rollouts.unbind(0))
+                        rollouts = list(rollouts.unbind(0))
 
-    # ====================================================================
-    # 5. LOG & CLEANUP: Report results and close resources
-    # ====================================================================
+            # 日志记录
+            evaluation_time = time.time() - evaluation_start
+            logger.log({"timers/evaluation_time": evaluation_time}, step=n_iters_performed)
+            logger.log_evaluation(rollouts, video_frames=video_frames, step=n_iters_performed, total_frames=total_frames)
+            logger.commit()
+            print(f"[Eval Worker]: Iteration {n_iters_performed} evaluation finished on CPU.")
+
+        except Exception: # 处理队列为空或超时的正常情况
+            continue
+
     test_env.close()
-
-    evaluation_time = time.time() - evaluation_start
-    logger.log({"timers/evaluation_time": evaluation_time}, step=n_iters_performed)
-    logger.log_evaluation(
-        rollouts,
-        video_frames=video_frames,
-        step=n_iters_performed,
-        total_frames=total_frames,
-    )
-    logger.commit()
     logger.finish()
-    print(f"\n[Eval Process]: Evaluation for iteration {n_iters_performed} complete. Results logged.")
 
 class Experiment(CallbackNotifier):
     """
@@ -557,10 +528,38 @@ class Experiment(CallbackNotifier):
         self.n_iters_performed = 0
         self.mean_return = 0
 
-        self.evaluation_process: Optional[multiprocessing.Process] = None
+        self.eval_weight_queue = multiprocessing.Queue(maxsize=1) # 保证只评估最新的
+        self.eval_stop_event = multiprocessing.Event()
+        self.evaluation_process = None
+        
+        if self.config.evaluation:
+            self._start_evaluation_worker()
 
         if self.config.restore_file is not None:
             self._load_experiment()
+    
+    def _start_evaluation_worker(self):
+        # 准备静态参数
+        args = (
+            self.eval_stop_event,
+            self.eval_weight_queue,
+            self.config,
+            self.algorithm_config,
+            self.model_config,
+            self.critic_model_config,
+            self.task,
+            self.group_map,
+            self.seed,
+            self.continuous_actions,
+            self.name,
+            self.folder_name,
+        )
+        self.evaluation_process = multiprocessing.Process(
+            target=_evaluation_worker,
+            args=args,
+            daemon=True # 随主进程退出
+        )
+        self.evaluation_process.start()
 
     @property
     def on_policy(self) -> bool:
@@ -989,47 +988,31 @@ class Experiment(CallbackNotifier):
             # Evaluation
             if (
                 self.config.evaluation
-                and (
-                    self.total_frames % self.config.evaluation_interval == 0
-                    or self.n_iters_performed == 0
-                )
+                and (self.total_frames % self.config.evaluation_interval == 0 or self.n_iters_performed == 0)
                 and (len(self.config.loggers) or self.config.create_json)
             ):
-                if self.evaluation_process is not None and self.evaluation_process.is_alive():
-                    warnings.warn(
-                        "Previous evaluation is still running. Skipping this one."
-                    )
-                else:
-                    print("\nStarting evaluation in a background process...")
-                    # Move policy to CPU and get state_dict to avoid pickling CUDA tensors
-                    policy_state_dict = self.policy.to("cpu").state_dict()
+                # 将策略拷贝到 CPU 并序列化
+                # 使用 state_dict() 时加上 .to("cpu") 确保子进程不触碰 CUDA
+                policy_state_dict = {
+                    k: v.cpu().detach() if isinstance(v, torch.Tensor) else v 
+                    for k, v in self.policy.state_dict().items()
+                }
+                
+                # 尝试推送到队列（非阻塞）
+                try:
+                    # 如果队列满了（旧的还没评完），先弹出旧的再放新的，保证评估的是最新权重
+                    if self.eval_weight_queue.full():
+                        try: self.eval_weight_queue.get_nowait()
+                        except: pass
                     
-                    # Prepare all necessary arguments for the top-level function.
-                    # All arguments must be pickle-able.
-                    args = (
-                        self.config,
-                        self.algorithm_config,
-                        self.model_config,
-                        self.critic_model_config,
-                        self.task,
-                        self.group_map,
-                        self.seed + self.n_iters_performed,
-                        self.continuous_actions,
-                        policy_state_dict,
-                        self.total_frames,
-                        self.n_iters_performed,
-                        self.name,
-                        self.folder_name,
-                    )
-
-                    self.evaluation_process = multiprocessing.Process(
-                        target=_run_evaluation_process,
-                        args=args
-                    )
-                    self.evaluation_process.start()
-
-                    # Immediately move policy back to the training device for continued training
-                    self.policy.to(self.config.train_device)
+                    self.eval_weight_queue.put_nowait((
+                        policy_state_dict, 
+                        self.total_frames, 
+                        self.n_iters_performed
+                    ))
+                    print(f"\n[Main]: Sent weights for iteration {self.n_iters_performed} to Eval Worker.")
+                except Exception as e:
+                    warnings.warn(f"Could not send weights to evaluation worker: {e}")
                 # self._evaluation_loop()
 
             # End of step
@@ -1062,11 +1045,12 @@ class Experiment(CallbackNotifier):
 
     def close(self):
         """Close the experiment."""
-        if self.evaluation_process is not None and self.evaluation_process.is_alive():
-            print("Waiting for the background evaluation process to finish...")
-            self.evaluation_process.join(timeout=30) # Wait for 30 seconds
+        if self.evaluation_process is not None:
+            print("Terminating background evaluation worker...")
+            self.eval_stop_event.set()
+            self.eval_weight_queue.put(None) # 发送特殊信号
+            self.evaluation_process.join(timeout=5)
             if self.evaluation_process.is_alive():
-                print("Evaluation process did not finish in time, terminating.")
                 self.evaluation_process.terminate()
         if not self.config.collect_with_grad:
             self.collector.shutdown()
@@ -1099,11 +1083,11 @@ class Experiment(CallbackNotifier):
 
                 loss_value.backward()
 
-                grad_norm = self._grad_clip(optimizer)
+                grad_norm_tensor = self._grad_clip(optimizer)
 
                 training_td.set(
                     f"grad_norm_{loss_name}",
-                    torch.tensor(grad_norm, device=self.config.train_device),
+                    grad_norm_tensor.detach(),
                 )
 
                 optimizer.step()
@@ -1138,7 +1122,7 @@ class Experiment(CallbackNotifier):
             if self.config.clip_grad_val is not None:
                 torch.nn.utils.clip_grad_value_(params, self.config.clip_grad_val)
 
-        return float(total_norm)
+        return total_norm
 
     @local_seed()
     @torch.no_grad()

@@ -31,98 +31,121 @@ from tensordict.nn import CompositeDistribution
 import torch
 from tensordict import TensorDictBase
 
-def install_nan_hunter(model):
+def install_nan_hunter(model, warning_threshold=1e4):
     """
-    给模型的所有子层安装 NaN 监控钩子 (支持 TensorDict 和 Nested Structure)。
-    无需 autograd，在 inference/rollout 模式下完全有效。
-    """
+    即插即用的数值监控工具 (NaN Hunter)。
+    功能：
+    1. 自动监控模型所有叶子层的输入/输出。
+    2. 发现 NaN/Inf 时抛出异常，发现数值过大时打印预警。
+    3. 兼容 vmap (自动跳过矢量化内部的数据依赖检查)。
+    4. 健壮性：自动处理 Bool、Int 等非浮点类型。
     
-    def _check_nan(data, location_name=""):
+    参数:
+        model: 要监控的 PyTorch 模型。
+        warning_threshold: 数值爆炸预警阈值，默认 1e4。
+    """
+    try:
+        # 用于检测当前 Tensor 是否处于 vmap 矢量化运算内部
+        from torch._C._functorch import is_batchedtensor
+    except ImportError:
+        def is_batchedtensor(t): return False
+
+    def _check_status(data, location_name=""):
         """
-        递归检查 data 中是否包含 NaN/Inf。
-        返回: (has_nan, details_string)
+        递归检查数据状态。返回: (is_critical, is_warning, message)
         """
-        # 1. 如果是 TensorDict
+        # 1. 处理 TensorDict
         if isinstance(data, TensorDictBase):
-            # 遍历所有叶子节点 (leaves_only=True 会自动递归嵌套的 TensorDict)
             for key, val in data.items(include_nested=True, leaves_only=True):
-                if isinstance(val, torch.Tensor):
-                    if torch.isnan(val).any() or torch.isinf(val).any():
-                        return True, f"{location_name}[TensorDict Key: '{key}']"
-            return False, None
+                crit, warn, msg = _check_status(val, f"{location_name}[Key: '{key}']")
+                if crit or warn: return crit, warn, msg
+            return False, False, None
 
-        # 2. 如果是 Tensor
+        # 2. 处理 Tensor
         elif isinstance(data, torch.Tensor):
-            if torch.isnan(data).any() or torch.isinf(data).any():
-                return True, f"{location_name}[Tensor shape={data.shape}]"
-            return False, None
+            # vmap 内部无法执行 .any() 或 .item() 等控制流操作，必须跳过
+            if is_batchedtensor(data):
+                return False, False, None
+            
+            # 2.1 检查致命错误 (NaN/Inf) - 仅针对浮点型
+            if torch.is_floating_point(data):
+                if torch.isnan(data).any() or torch.isinf(data).any():
+                    return True, True, f"{location_name} 发现 NaN/Inf! [Shape={list(data.shape)}]"
+            
+            # 2.2 检查爆炸预警 (数值过大)
+            # 排除布尔型，仅检查浮点型和整型
+            if data.dtype != torch.bool:
+                # 使用 abs().max() 检查是否接近爆炸
+                max_val = data.abs().max().item()
+                if max_val > warning_threshold:
+                    return False, True, f"{location_name} 数值过大: {max_val:.2e} (超过阈值 {warning_threshold:.0e})"
+            
+            return False, False, None
 
-        # 3. 如果是 Tuple 或 List
+        # 3. 处理 Tuple 或 List (常用于多输入 args)
         elif isinstance(data, (tuple, list)):
             for i, item in enumerate(data):
-                found, msg = _check_nan(item, f"{location_name}[Seq index: {i}]")
-                if found:
-                    return True, msg
-            return False, None
-
-        # 4. 其他类型忽略 (如 None, int, str)
-        return False, None
+                crit, warn, msg = _check_status(item, f"{location_name}[Idx: {i}]")
+                if crit or warn: return crit, warn, msg
+        
+        return False, False, None
 
     def _print_stats(data, prefix=""):
-        """辅助函数：打印数据的统计信息"""
+        """安全打印数据的统计信息"""
         if isinstance(data, torch.Tensor):
-             print(f"{prefix} Tensor {data.shape}: Min={data.min():.4f}, Max={data.max():.4f}, Mean={data.mean():.4f}, HasNaN={torch.isnan(data).any()}")
+            if is_batchedtensor(data):
+                print(f"{prefix} Tensor {data.shape}: <vmap 内部数据，无法计算统计>")
+            elif data.dtype == torch.bool:
+                print(f"{prefix} Tensor {data.shape} [Bool]: True数量={data.sum().item()}")
+            elif torch.is_floating_point(data):
+                # 打印浮点数统计，包含标准差以观察分布
+                print(f"{prefix} Tensor {data.shape}: Min={data.min().item():.4f}, Max={data.max().item():.4f}, Mean={data.mean().item():.4f}, Std={data.std().item():.4f}")
+            else:
+                print(f"{prefix} Tensor {data.shape} [{data.dtype}]: Min={data.min().item()}, Max={data.max().item()}")
+        
         elif isinstance(data, TensorDictBase):
-            print(f"{prefix} TensorDict Keys: {data.keys(include_nested=True)}")
-            # 简单打印第一个 key 的状态作为示例，防止刷屏
             for key, val in data.items(include_nested=True, leaves_only=True):
-                 if isinstance(val, torch.Tensor):
-                    print(f"{prefix}   -> Key '{key}': Min={val.min():.4f}, Max={val.max():.4f}, HasNaN={torch.isnan(val).any()}")
+                if isinstance(val, torch.Tensor):
+                    _print_stats(val, prefix=f"{prefix} -> '{key}':")
+        
+        elif isinstance(data, (tuple, list)):
+            for i, item in enumerate(data):
+                _print_stats(item, prefix=f"{prefix}[Idx: {i}]")
 
     def _hook(module, args, output):
-        # args 是输入 (tuple), output 是输出 (可以是 Tensor, TensorDict, Tuple 等)
-        
-        # --- 1. 检查输入 (Input) ---
-        # args 永远是一个 tuple，比如 (tensordict, ) 或者 (tensor_a, tensor_b)
-        for i, arg in enumerate(args):
-            has_nan, loc = _check_nan(arg, location_name=f"Input arg {i}")
-            if has_nan:
-                # 发现输入就有 NaN，通常意味着上一层或者是数据源的问题
-                # 我们可以选择忽略，或者打印警告
-                # print(f"⚠️ Warning: Layer {type(module).__name__} received NaN at {loc}")
-                pass 
+        # 同时检查输入和输出
+        in_crit, in_warn, in_msg = _check_status(args, "Input")
+        out_crit, out_warn, out_msg = _check_status(output, "Output")
 
-        # --- 2. 检查输出 (Output) ---
-        has_nan_out, loc_out = _check_nan(output, location_name="Output")
-
-        if has_nan_out:
-            print(f"\n{'='*60}")
-            print(f"🚨 抓到了！NaN 产生于层: {module}")
-            print(f"   类型: {type(module).__name__}")
-            print(f"   具体位置: {loc_out}")
-            print(f"{'='*60}")
+        if in_warn or out_warn or in_crit or out_crit:
+            print(f"\n{'!'*20} 数值异常预警 {'!'*20}")
+            print(f"层: {module}")
+            print(f"类型: {type(module).__name__}")
             
-            print("\n--- 🕵️‍♂️ 现场数据分析 ---")
+            if in_msg: print(f"【输入异常】: {in_msg}")
+            if out_msg: print(f"【输出异常】: {out_msg}")
             
-            print("1. 输入数据统计:")
-            for i, arg in enumerate(args):
-                _print_stats(arg, prefix=f"Arg[{i}]:")
-
-            print("\n2. 输出数据统计:")
-            _print_stats(output, prefix="Output:")
+            print("\n--- 🕵️‍♂️ 现场数据回溯 ---")
+            print("1. 输入 (Input Args):")
+            _print_stats(args, prefix="   ")
+            print("\n2. 输出 (Output):")
+            _print_stats(output, prefix="   ")
             
-            # 抛出异常，暂停程序
-            raise RuntimeError(f"NaN detected in forward pass of {type(module).__name__}")
+            # 只有发现真实的 NaN/Inf 时才抛出异常停止程序
+            if in_crit or out_crit:
+                raise RuntimeError(f"🚨 发现 NaN/Inf，为防止破坏 Checkpoint，程序已强制停止。")
+            else:
+                print(f"{'!'*50}\n")
 
-    # 递归注册到所有子模块
-    print(f"🕵️‍♂️ NaN Hunter (TensorDict版) 正在启动...")
+    # 递归注册到所有实际执行计算的叶子层
+    print(f"🕵️‍♂️ NaN Hunter 启动中... (预警阈值: {warning_threshold:.0e})")
+    counter = 0
     for name, layer in model.named_modules():
-        # 我们可以跳过一些不进行计算的容器层，比如 Sequential，只监控实际的叶子层
-        # 但为了保险，监控所有层也行，除了本身就是容器的
+        # 只挂载叶子节点，避免在容器层（如 Sequential）重复触发
         if len(list(layer.children())) == 0: 
-            # print(f"  -> 监控层：{name} ({type(layer).__name__})")
             layer.register_forward_hook(_hook)
-    print("✅ 监控已就绪。")
+            counter += 1
+    print(f"✅ 监控已就绪，已成功挂载 {counter} 个计算层。")
 
 class Mappo(Algorithm):
     """Multi Agent PPO (from `https://arxiv.org/abs/2103.01955 <https://arxiv.org/abs/2103.01955>`__).
@@ -187,8 +210,8 @@ class Mappo(Algorithm):
             entropy_coef=self.entropy_coef,
             critic_coef=self.critic_coef,
             loss_critic_type=self.loss_critic_type,
-            # normalize_advantage=True,
-            # normalize_advantage_exclude_dims=[1]
+            normalize_advantage=True,
+            normalize_advantage_exclude_dims=[2]
         )
         loss_module.set_keys(
             reward=(group, "reward"),
@@ -434,7 +457,6 @@ class Mappo(Algorithm):
                 *self.action_spec[group, "action"].shape,
                 self.action_spec[group, "action"].space.n,
             ]
-
         actor_input_spec = Composite(
             {group: self.observation_spec[group].clone().to(self.device)}
         )

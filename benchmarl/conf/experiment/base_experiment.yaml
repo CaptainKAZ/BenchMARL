@@ -23,7 +23,7 @@ parallel_collection: False
 # Discount factor
 gamma: 0.995
 # Learning rate
-lr: 0.00005
+lr: 0.00001
 # The epsilon parameter of the adam optimizer
 adam_eps: 0.000001
 # Clips grad norm if true and clips grad value if false

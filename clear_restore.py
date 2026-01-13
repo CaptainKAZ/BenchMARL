@@ -234,7 +234,7 @@ class WinRateReportDebounced(Callback):
     1. 当胜率 < low_threshold (0.3) -> 进入进攻方特训，直到胜率回升至 recovery_threshold (0.5)。
     2. 当胜率 > high_threshold (0.7) -> 进入防守方特训，直到胜率回落至 recovery_threshold (0.5)。
     """
-    def __init__(self, win_rate_threshold: float = 0.35, recovery_threshold: float = 0.52):
+    def __init__(self, win_rate_threshold: float = 0.3, recovery_threshold: float = 0.52):
         self.win_rate_threshold = win_rate_threshold
         self.high_threshold = 1.0 - win_rate_threshold
         self.recovery_threshold = recovery_threshold
@@ -362,10 +362,10 @@ if __name__ == '__main__':
 
     attacker_algorithm_config = MappoConfig.get_from_yaml()
     attacker_algorithm_config.share_param_actor = False
-    # attacker_algorithm_config.share_param_critic = False
+    attacker_algorithm_config.share_param_critic = False
     defender_algorithm_config = MappoConfig.get_from_yaml()
     defender_algorithm_config.share_param_actor = True
-    # defender_algorithm_config.share_param_critic = True
+    defender_algorithm_config.share_param_critic = True
     print(attacker_algorithm_config,defender_algorithm_config)
     algorithm_config = EnsembleAlgorithmConfig({"attacker":attacker_algorithm_config, "defender":defender_algorithm_config})
     algorithm_config = MappoConfig.get_from_yaml()
@@ -375,7 +375,7 @@ if __name__ == '__main__':
             GruConfig.get_from_yaml(),
         ],
         intermediate_sizes=[
-            96
+            128
         ],  # Nuber of intermediate outputs. List of size n_layers - 1
     )
     # attacker_model_config = AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_attacker.yaml")
@@ -385,7 +385,7 @@ if __name__ == '__main__':
             GruConfig.get_from_yaml(),
         ],
         intermediate_sizes=[
-            96
+            128
         ],  # Nuber of intermediate outputs. List of size n_layers - 1
     )
     # defender_model_config = AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_defender.yaml")
