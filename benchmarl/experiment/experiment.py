@@ -15,7 +15,7 @@ import shutil
 import time
 import warnings
 from collections import deque, OrderedDict
-from dataclasses import dataclass, MISSING
+from dataclasses import dataclass, MISSING, field
 from pathlib import Path
 
 from typing import Any, Dict, List, Optional, Union
@@ -31,6 +31,7 @@ from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
 from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
 
+from benchmarl.algorithms.ensemble import EnsembleAlgorithm
 from benchmarl.algorithms import IppoConfig, MappoConfig
 
 from benchmarl.algorithms.common import AlgorithmConfig
@@ -127,7 +128,11 @@ class ExperimentConfig:
     checkpoint_at_end: bool = MISSING
     keep_checkpoints_num: Optional[int] = MISSING
 
-    evaluation_device: str = "cpu" 
+    # Mixed precision training
+    use_amp: bool = MISSING
+    amp_dtype: str = MISSING  # "float16" or "bfloat16"
+
+    evaluation_device: str = "cpu"
 
     def train_batch_size(self, on_policy: bool) -> int:
         """
@@ -381,7 +386,12 @@ def _evaluation_worker(
 
     exp_shell = ExperimentShell()
     algorithm = algorithm_config.get_algorithm(exp_shell)
-    algorithm.device = torch.device("cpu")
+    if isinstance(algorithm, EnsembleAlgorithm):
+        for aglo in algorithm.algorithms_map.values():
+            aglo.device = torch.device("cpu")
+    else:
+        algorithm.device = torch.device("cpu")
+    
 
     # 环境转换
     transforms_env = Compose(*task.get_env_transforms(test_env))
@@ -577,6 +587,7 @@ class Experiment(CallbackNotifier):
         self._setup_algorithm()
         self._setup_collector()
         self._setup_logger()
+
         self._on_setup()
 
     def _perform_checks(self):
@@ -716,6 +727,18 @@ class Experiment(CallbackNotifier):
             }
             for group in self.group_map.keys()
         }
+
+        # Initialize mixed precision GradScaler (one per group)
+        self.grad_scalers = {}
+        if self.config.use_amp and self.config.train_device != "cpu":
+            # Determine precision type
+            amp_dtype = torch.float16 if self.config.amp_dtype == "float16" else torch.bfloat16
+            self.amp_dtype = amp_dtype
+
+            for group in self.group_map.keys():
+                self.grad_scalers[group] = GradScaler()
+        else:
+            self.amp_dtype = torch.float32
 
     def _setup_collector(self):
         self.policy = self.algorithm.get_policy_for_collection()
@@ -1073,25 +1096,52 @@ class Experiment(CallbackNotifier):
 
     def _optimizer_loop(self, group: str) -> TensorDictBase:
         subdata = self.replay_buffers[group].sample().to(self.config.train_device)
-        loss_vals = self.losses[group](subdata)
+
+        # 1. Forward pass (with mixed precision if enabled)
+        if self.config.use_amp and self.config.train_device != "cpu":
+            with autocast(device_type='cuda', dtype=self.amp_dtype):
+                loss_vals = self.losses[group](subdata)
+        else:
+            loss_vals = self.losses[group](subdata)
+
         training_td = loss_vals.detach()
         loss_vals = self.algorithm.process_loss_vals(group, loss_vals)
 
+        # 2. Backward pass and optimization
         for loss_name, loss_value in loss_vals.items():
             if loss_name in self.optimizers[group].keys():
                 optimizer = self.optimizers[group][loss_name]
 
-                loss_value.backward()
+                if self.config.use_amp and self.config.train_device != "cpu":
+                    # Mixed precision training flow
+                    scaler = self.grad_scalers[group]
 
-                grad_norm_tensor = self._grad_clip(optimizer)
+                    # Scale loss and backward
+                    scaler.scale(loss_value).backward()
+
+                    # Unscale gradients for clipping
+                    scaler.unscale_(optimizer)
+
+                    # Gradient clipping (on unscaled FP32 gradients)
+                    grad_norm_tensor = self._grad_clip(optimizer)
+
+                    # Optimizer step with scaler
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                else:
+                    # Original FP32 training flow
+                    loss_value.backward()
+                    grad_norm_tensor = self._grad_clip(optimizer)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
                 training_td.set(
                     f"grad_norm_{loss_name}",
                     grad_norm_tensor.detach(),
                 )
 
-                optimizer.step()
-                optimizer.zero_grad()
+        # 3. Update replay buffer priority and target networks
         self.replay_buffers[group].update_tensordict_priority(subdata)
         if self.target_updaters[group] is not None:
             self.target_updaters[group].step()
@@ -1208,6 +1258,14 @@ class Experiment(CallbackNotifier):
         )
         if not self.config.collect_with_grad:
             state_dict.update({"collector": self.collector.state_dict()})
+
+        # Save GradScaler state for mixed precision training
+        if self.config.use_amp and self.config.train_device != "cpu":
+            state_dict.update({
+                f"grad_scaler_{k}": scaler.state_dict()
+                for k, scaler in self.grad_scalers.items()
+            })
+
         return state_dict
 
     def load_state_dict(self, state_dict: Dict) -> None:
@@ -1223,6 +1281,13 @@ class Experiment(CallbackNotifier):
                 self.replay_buffers[group].load_state_dict(
                     state_dict[f"buffer_{group}"]
                 )
+
+            # Load GradScaler state for mixed precision training
+            if self.config.use_amp and self.config.train_device != "cpu":
+                scaler_key = f"grad_scaler_{group}"
+                if scaler_key in state_dict:
+                    self.grad_scalers[group].load_state_dict(state_dict[scaler_key])
+
         if not self.config.collect_with_grad:
             self.collector.load_state_dict(state_dict["collector"])
         self.total_time = state_dict["state"]["total_time"]

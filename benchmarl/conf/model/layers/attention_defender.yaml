@@ -9,10 +9,10 @@ name: attention
 # ------------------------------------------------------------------------------
 embedding_dim: 128          # 内部特征映射维度
 num_heads: 4                # 注意力头数
-num_attention_layers: 1     # Transformer 层数
+num_attention_layers: 2     # Transformer 层数
 ffn_multiplier: 4           # FFN 隐藏层倍数 (128 * 4 = 512)
 dropout_prob: 0.0           # 强化学习建议设为 0，除非过拟合严重
-final_mlp_hidden_layers: [256] 
+final_mlp_hidden_layers: [128,128] 
 
 # 【关键配置】启用 Ego-Embedding 模式
 # 这意味着 Transformer 输出后，只取 Sequence 中的第一个 Token (Ego) 做决策
@@ -25,15 +25,15 @@ use_ego_embedding: True
 # 只有物理维度相同、且逻辑相似的实体才应该放在一组。
 # 代码会自动为组内的特征拼接 One-Hot ID 以区分身份。
 
-encoder_groups:
-  # --- 组 1: 动态单位 (Players) ---
-  # 它们都是 4 维 (x, y, vx, vy)，物理规律一致。
-  # 共享同一个权重矩阵，利用 ID (0, 1, 2) 区分自我、队友、敌人。
-  players:
-    features:
-      - teammate_embed
-      - opponent1_embed
-      - opponent2_embed
+# encoder_groups:
+#   # --- 组 1: 动态单位 (Players) ---
+#   # 它们都是 4 维 (x, y, vx, vy)，物理规律一致。
+#   # 共享同一个权重矩阵，利用 ID (0, 1, 2) 区分自我、队友、敌人。
+#   players:
+#     features:
+#       - teammate_embed
+#       - opponent1_embed
+#       - opponent2_embed
 
 
 # ------------------------------------------------------------------------------

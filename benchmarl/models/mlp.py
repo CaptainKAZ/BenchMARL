@@ -48,6 +48,7 @@ class Mlp(Model):
             action_spec=kwargs.pop("action_spec"),
             model_index=kwargs.pop("model_index"),
             is_critic=kwargs.pop("is_critic"),
+            name=kwargs.pop("name")
         )
 
         self.input_features = sum(

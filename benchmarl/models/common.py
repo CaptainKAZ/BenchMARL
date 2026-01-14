@@ -91,6 +91,7 @@ class Model(TensorDictModuleBase, ABC):
         action_spec: Composite,
         model_index: int,
         is_critic: bool,
+        name: str = None,
     ):
         TensorDictModuleBase.__init__(self)
 
@@ -105,6 +106,7 @@ class Model(TensorDictModuleBase, ABC):
         self.action_spec = action_spec
         self.model_index = model_index
         self.is_critic = is_critic
+        self.name = name or f"{self.__class__.__name__}_{agent_group}_{model_index}"
 
         self.in_keys = list(self.input_spec.keys(True, True))
         self.out_keys = list(self.output_spec.keys(True, True))
@@ -260,6 +262,7 @@ class ModelConfig(ABC):
         device: DEVICE_TYPING,
         action_spec: Composite,
         model_index: int = 0,
+        name: str = None,
     ) -> Model:
         """
         Creates the model from the config.
@@ -284,6 +287,7 @@ class ModelConfig(ABC):
                 for centralized critics with global input.
             action_spec (Composite): The action spec of the environment
             model_index (int): the index of the model in a sequence. Defaults to 0.
+            name (str): optional name for the model for debugging purposes
 
         Returns: the Model
 
@@ -301,6 +305,7 @@ class ModelConfig(ABC):
             action_spec=action_spec,
             model_index=model_index,
             is_critic=self.is_critic,
+            name=name,
         )
 
     @staticmethod
@@ -445,6 +450,7 @@ class SequenceModelConfig(ModelConfig):
         device: DEVICE_TYPING,
         action_spec: Composite,
         model_index: int = 0,
+        name: str = None,
     ) -> Model:
         n_models = len(self.model_configs)
         if not n_models > 0:
@@ -481,6 +487,7 @@ class SequenceModelConfig(ModelConfig):
                 device=device,
                 action_spec=action_spec,
                 model_index=0,
+                name=f"{name}_layer0" if name else None,
             )
         ]
 
@@ -496,6 +503,7 @@ class SequenceModelConfig(ModelConfig):
                 device=device,
                 action_spec=action_spec,
                 model_index=i,
+                name=f"{name}_layer{i}" if name else None,
             )
             for i in range(1, n_models)
         ]
@@ -541,13 +549,13 @@ class EnsembleModelConfig(ModelConfig):
 
     model_configs_map: Dict[str, ModelConfig]
 
-    def get_model(self, agent_group: str, **kwargs) -> Model:
+    def get_model(self, agent_group: str, name: str = None, **kwargs) -> Model:
         if agent_group not in self.model_configs_map.keys():
             raise ValueError(
                 f"Environment contains agent group '{agent_group}' not present in the EnsembleModelConfig configuration."
             )
         return self.model_configs_map[agent_group].get_model(
-            **kwargs, agent_group=agent_group
+            **kwargs, agent_group=agent_group, name=name
         )
 
     @staticmethod

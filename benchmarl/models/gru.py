@@ -20,6 +20,7 @@ from torchrl.modules import GRUCell, MLP, MultiAgentMLP
 
 from benchmarl.models.common import Model, ModelConfig
 from benchmarl.utils import DEVICE_TYPING
+from benchmarl.models.debug_utils import debug_print, debug_separator
 
 
 class GRU(torch.nn.Module):
@@ -433,6 +434,8 @@ class Gru(Model):
             )
 
     def _forward(self, tensordict: TensorDictBase) -> TensorDictBase:
+        debug_separator(self.name, "FORWARD START")
+
         # Gather in_key
         input = torch.cat(
             [
@@ -442,17 +445,27 @@ class Gru(Model):
             ],
             dim=-1,
         )
+        debug_print(self.name, "Input tensor", input,
+                   f"input_has_agent_dim={self.input_has_agent_dim}, "
+                   f"output_has_agent_dim={self.output_has_agent_dim}, "
+                   f"share_params={self.share_params}")
+
         h_0 = tensordict.get(self.hidden_state_name, None)
         is_init = tensordict.get("is_init")
         training = h_0 is None
 
         # Has multi-agent input dimension
         if self.input_has_agent_dim:
+            debug_print(self.name, "Processing with agent dimension", input)
             output, h_n = self.gru(input, is_init, h_0)
+            debug_print(self.name, "GRU output (with agent dim)", output)
+
             if not self.output_has_agent_dim:
                 output = output[..., 0, :]
+                debug_print(self.name, "Output after removing agent dim", output)
         else:  # Is a global input, this is a critic
-            # Check input
+            debug_print(self.name, "Processing global input (critic)", input)
+
             batch = input.shape[0]
             seq = input.shape[1]
             assert input.shape == (batch, seq, self.input_features)
@@ -465,38 +478,45 @@ class Gru(Model):
             )
             if self.share_params:
                 output, _ = self.gru[0](input, is_init, h_0)
+                debug_print(self.name, "GRU output (shared params)", output)
             else:
                 outputs = []
-                for net in self.gru:
-                    output, _ = net(input, is_init, h_0)
-                    outputs.append(output)
+                for i, net in enumerate(self.gru):
+                    agent_output, _ = net(input, is_init, h_0)
+                    debug_print(self.name, f"GRU output for agent {i}", agent_output)
+                    outputs.append(agent_output)
                 output = torch.stack(outputs, dim=-2)
+                debug_print(self.name, "Stacked GRU outputs", output)
 
         # 【核心逻辑】：执行直通拼接 (Passthrough Concatenation)
         if self.use_input_passthrough:
-            # 这里的 output 是 GRU 的输出
-            # input 是原始特征
-            
-            # 兼容性处理：如果 GRU 的 output 丢弃了 Agent 维度 (例如某些 Critic 场景)，
-            # 原始 input 也需要对应切片才能拼接。
             input_for_mlp = input
             if self.input_has_agent_dim and not self.output_has_agent_dim:
                  input_for_mlp = input[..., 0, :]
-            
-            # 沿着特征维度拼接
+
+            debug_print(self.name, "Before passthrough concat - GRU output", output)
+            debug_print(self.name, "Before passthrough concat - input", input_for_mlp)
+
             output = torch.cat([output, input_for_mlp], dim=-1)
+            debug_print(self.name, "After passthrough concatenation", output)
 
         # Mlp
         if self.output_has_agent_dim:
             output = self.mlp.forward(output)
+            debug_print(self.name, "MLP output (with agent dim)", output)
         else:
             if not self.share_params:
                 output = torch.stack(
                     [net(output) for net in self.mlp],
                     dim=-2,
                 )
+                debug_print(self.name, "MLP output (unshared params)", output)
             else:
                 output = self.mlp[0](output)
+                debug_print(self.name, "MLP output (shared params)", output)
+
+        debug_print(self.name, "Final output", output)
+        debug_separator(self.name, "FORWARD END")
 
         tensordict.set(self.out_key, output)
         if not training:

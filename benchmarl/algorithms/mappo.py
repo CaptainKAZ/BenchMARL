@@ -29,7 +29,6 @@ from torchrl.data import CompositeSpec, BoundedTensorSpec, UnboundedContinuousTe
 from tensordict.nn import CompositeDistribution
 
 import torch
-from tensordict import TensorDictBase
 
 def install_nan_hunter(model, warning_threshold=1e4):
     """
@@ -207,11 +206,11 @@ class Mappo(Algorithm):
             actor=policy_for_loss,
             critic=self.get_critic(group),
             clip_epsilon=self.clip_epsilon,
-            entropy_coef=self.entropy_coef,
-            critic_coef=self.critic_coef,
+            entropy_coeff=self.entropy_coef,
+            critic_coeff=self.critic_coef,
             loss_critic_type=self.loss_critic_type,
-            normalize_advantage=True,
-            normalize_advantage_exclude_dims=[2]
+            normalize_advantage=False,
+            # normalize_advantage_exclude_dims=[-2]
         )
         loss_module.set_keys(
             reward=(group, "reward"),
@@ -469,7 +468,7 @@ class Mappo(Algorithm):
                 )
             }
         )
-        print(f"making actor model for {group}")
+        print(f"making actor model for {group}, share param {self.share_param_actor}")
         actor_module = model_config.get_model(
             input_spec=actor_input_spec,
             output_spec=actor_output_spec,
@@ -480,8 +479,8 @@ class Mappo(Algorithm):
             share_params=self.share_param_actor,
             device=self.device,
             action_spec=self.action_spec,
+            name=f"{group}_actor"
         )
-        print(actor_module)
 
         if continuous:
             extractor_module = TensorDictModule(
@@ -632,7 +631,7 @@ class Mappo(Algorithm):
             critic_input_spec = Composite(
                 {group: self.observation_spec[group].clone().to(self.device)}
             )
-        print(f"making critic model for {group}")
+        print(f"making critic model for {group}, share_param {self.share_param_critic}")
         value_module = self.critic_model_config.get_model(
             input_spec=critic_input_spec,
             output_spec=critic_output_spec,
@@ -643,8 +642,9 @@ class Mappo(Algorithm):
             share_params=self.share_param_critic,
             device=self.device,
             action_spec=self.action_spec,
+            name=f"{group}_critic"
         )
-        print(value_module)
+
         if self.share_param_critic:
             expand_module = TensorDictModule(
                 lambda value: value.unsqueeze(-2).expand(

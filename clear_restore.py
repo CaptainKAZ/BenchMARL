@@ -4,7 +4,6 @@ from benchmarl.algorithms import IppoConfig
 from benchmarl.environments import LayupTask # 替换为您重构后的新环境
 from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.models.gru import GruConfig
-from benchmarl.models.gtrxl import GTrXLConfig
 from benchmarl.models.mlp import MlpConfig
 from benchmarl.models.attention import AttentionConfig
 from benchmarl.models.mamba import MambaConfig
@@ -18,9 +17,12 @@ from benchmarl.models import EnsembleModelConfig
 from benchmarl.algorithms import EnsembleAlgorithmConfig
 from torch.profiler import profile, ProfilerActivity
 from collections import OrderedDict
+import argparse
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 from benchmarl.models.common import SequenceModelConfig
+from benchmarl.models.debug_utils import setup_model_logging
+
 # from torch.cuda.amp import GradScaler, autocast
 
 def print_dict_paths(d, path=""):
@@ -234,7 +236,7 @@ class WinRateReportDebounced(Callback):
     1. 当胜率 < low_threshold (0.3) -> 进入进攻方特训，直到胜率回升至 recovery_threshold (0.5)。
     2. 当胜率 > high_threshold (0.7) -> 进入防守方特训，直到胜率回落至 recovery_threshold (0.5)。
     """
-    def __init__(self, win_rate_threshold: float = 0.3, recovery_threshold: float = 0.52):
+    def __init__(self, win_rate_threshold: float = 0.3, recovery_threshold: float = 0.58):
         self.win_rate_threshold = win_rate_threshold
         self.high_threshold = 1.0 - win_rate_threshold
         self.recovery_threshold = recovery_threshold
@@ -334,41 +336,248 @@ from health_check import HealthCheckCallback
 # checkpoint_path = "outputs/2025-07-06_19-39-05/mappo_layup_gru__c217740f_25_07_06-19_39_05/checkpoints"
 checkpoint_pattern="outputs/**/checkpoints/*.pt"
 
-if __name__ == '__main__':
-    # 1. 定义预训练模型的路径
-    # restore_file_path = find_latest_file(checkpoint_path,"*.pt")
-    # torch.autograd.set_detect_anomaly(True)
-    restore_file_path = find_latest_checkpoint(checkpoint_pattern)
-    print(f"found checkpoint: {restore_file_path}")
-    if restore_file_path is None:
-        exit(1)
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(
+        description='RoboCon 2025 MARL Training Script',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+训练模式:
+  cold        从零开始 (默认)
+  cont        继续训练所有组
+  atk-c       保留attacker critic
+  def-c       保留defender critic
+  atk-a       只加载attacker actor
+  def-a       只加载defender actor
+  both-a      加载双方actor
 
-    # # # # 2. 加载检查点文件并只提取模型权重
-    # print(f"Loading checkpoint from {restore_file_path}...")
-    # checkpoint = torch.load(restore_file_path)
-    # print_dict_paths(checkpoint)
-    # print("Successfully extracted model weights.")
-    # 3. 配置并创建新环境的实验
+示例:
+  python clear_restore.py -m cold
+  python clear_restore.py -m cont
+  python clear_restore.py -m atk-a -c outputs/xxx/checkpoint.pt
+        """
+    )
+
+    parser.add_argument(
+        '-m', '--mode',
+        type=str,
+        default='cold',
+        choices=['cold', 'cont', 'atk-c', 'def-c', 'atk-a', 'def-a', 'both-a'],
+        help='训练模式'
+    )
+
+    parser.add_argument(
+        '-c', '--checkpoint',
+        type=str,
+        default=None,
+        help='checkpoint路径 (不指定则自动找最新)'
+    )
+
+    parser.add_argument(
+        '-p', '--pattern',
+        type=str,
+        default='outputs/**/checkpoints/*.pt',
+        help='checkpoint搜索模式'
+    )
+
+    # 模型调试日志参数
+    parser.add_argument(
+        '--debug-log',
+        action='store_true',
+        help='启用模型调试日志'
+    )
+
+    parser.add_argument(
+        '--debug-console',
+        action='store_true',
+        help='输出调试日志到控制台 (默认: True)'
+    )
+
+    parser.add_argument(
+        '--no-debug-console',
+        dest='debug_console',
+        action='store_false',
+        default=True,
+        help='禁用控制台调试日志输出'
+    )
+
+    parser.add_argument(
+        '--debug-file',
+        action='store_true',
+        help='输出调试日志到文件'
+    )
+
+    parser.add_argument(
+        '--debug-file-path',
+        type=str,
+        default=None,
+        help='调试日志文件路径 (默认: outputs/{timestamp}/model_debug.log)'
+    )
+
+    parser.add_argument(
+        '--debug-console-level',
+        type=str,
+        default='DEBUG',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        help='控制台日志级别 (默认: DEBUG)'
+    )
+
+    parser.add_argument(
+        '--debug-file-level',
+        type=str,
+        default='DEBUG',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        help='文件日志级别 (默认: DEBUG)'
+    )
+
+    return parser.parse_args()
+
+def load_checkpoint_for_mode(experiment_config, mode, checkpoint_path, pattern):
+    """根据模式设置checkpoint配置，返回checkpoint对象（用于部分加载）"""
+    if mode == 'cold':
+        print("\n[COLD START] Starting fresh training.\n")
+        # Cold start: 设置宽松的初始 shot threshold
+        os.environ['VMAS_INITIAL_SHOT_THRESHOLD'] = '0.6'
+        print("[ENV] Set VMAS_INITIAL_SHOT_THRESHOLD = 0.6 (lenient for cold start)")
+        return None
+
+    # 确定checkpoint路径
+    if checkpoint_path is None:
+        checkpoint_path = find_latest_checkpoint(pattern)
+        if checkpoint_path is None:
+            print(f"[WARNING] No checkpoint found. Starting from scratch.\n")
+            return None
+
+    print(f"\n[LOADING] Checkpoint: {checkpoint_path}")
+
+    if mode == 'cont':
+        # 使用 experiment_config.restore_file 恢复完整状态
+        print("[CONTINUE] Setting restore_file for full state recovery...")
+        experiment_config.restore_file = checkpoint_path
+        # Continue training: 使用目标难度
+        os.environ['VMAS_INITIAL_SHOT_THRESHOLD'] = '0.2'
+        print("[ENV] Set VMAS_INITIAL_SHOT_THRESHOLD = 0.2 (target difficulty for continue)")
+        print("  ✓ Will restore: actor + critic + optimizer + buffer")
+        print("[DONE] Checkpoint configured!\n")
+        return None
+    else:
+        # 其他模式需要手动加载部分权重（部分加载也算继续训练，使用目标难度）
+        os.environ['VMAS_INITIAL_SHOT_THRESHOLD'] = '0.2'
+        print("[ENV] Set VMAS_INITIAL_SHOT_THRESHOLD = 0.2 (target difficulty for partial load)")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        print_dict_paths(checkpoint)
+        return checkpoint
+
+def load_actor_only(experiment, checkpoint, group):
+    """只加载指定group的actor权重"""
+    ACTOR_PREFIX = "actor_network_params."
+    loss_key = f"loss_{group}"
+
+    if loss_key not in checkpoint:
+        print(f"  ✗ Warning: No weights found for group '{group}'")
+        return
+
+    full_group_state_dict = checkpoint[loss_key]
+    actor_state_dict = {
+        key.removeprefix(ACTOR_PREFIX): value
+        for key, value in full_group_state_dict.items()
+        if key.startswith(ACTOR_PREFIX)
+    }
+
+    try:
+        actor_network = experiment.losses[group].actor_network_params
+        actor_network.load_state_dict(actor_state_dict, strict=False)
+        print(f"  ✓ Loaded {group} actor (critic remains fresh)")
+    except Exception as e:
+        print(f"  ✗ Failed to load {group} actor: {e}")
+
+def apply_partial_checkpoint(experiment, checkpoint, mode):
+    """在实验创建后应用部分checkpoint加载"""
+    if checkpoint is None:
+        return
+
+    if mode == 'atk-c':
+        print("[ATK-C] Attacker full + Defender fresh...")
+        if "loss_attacker" in checkpoint:
+            experiment.losses["attacker"].load_state_dict(checkpoint["loss_attacker"])
+            print("  ✓ Attacker (actor + critic)")
+        print("  ✓ Defender fresh")
+
+    elif mode == 'def-c':
+        print("[DEF-C] Defender full + Attacker fresh...")
+        if "loss_defender" in checkpoint:
+            experiment.losses["defender"].load_state_dict(checkpoint["loss_defender"])
+            print("  ✓ Defender (actor + critic)")
+        print("  ✓ Attacker fresh")
+
+    elif mode == 'atk-a':
+        print("[ATK-A] Loading attacker actor only...")
+        load_actor_only(experiment, checkpoint, 'attacker')
+
+    elif mode == 'def-a':
+        print("[DEF-A] Loading defender actor only...")
+        load_actor_only(experiment, checkpoint, 'defender')
+
+    elif mode == 'both-a':
+        print("[BOTH-A] Loading both actors...")
+        load_actor_only(experiment, checkpoint, 'attacker')
+        load_actor_only(experiment, checkpoint, 'defender')
+
+    print("[DONE] Checkpoint loaded!\n")
+
+if __name__ == '__main__':
+    # 解析命令行参数
+    args = parse_args()
+
+    print("="*60)
+    print(f"Training Mode: {args.mode}")
+    if args.checkpoint:
+        print(f"Checkpoint: {args.checkpoint}")
+    print("="*60 + "\n")
+
+    # 配置实验
     experiment_config = ExperimentConfig.get_from_yaml()
-    experiment_config.restore_file = restore_file_path
+
+    # 根据模式配置checkpoint（cont模式会设置restore_file）
+    checkpoint = load_checkpoint_for_mode(experiment_config, args.mode, args.checkpoint, args.pattern)
 
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S").replace(":", "-")
     folder_name= f"outputs/{current_time}"
     os.makedirs(folder_name)
     experiment_config.save_folder = folder_name
 
+    # ========== 配置模型调试日志 ==========
+    if args.debug_log:
+        # 如果没有指定文件路径，使用默认路径（与实验输出同目录）
+        debug_file_path = args.debug_file_path
+        if args.debug_file and debug_file_path is None:
+            debug_file_path = f"{folder_name}/model_debug.log"
+
+        setup_model_logging(
+            log_to_console=args.debug_console,
+            log_to_file=args.debug_file,
+            log_file_path=debug_file_path,
+            console_level=args.debug_console_level,
+            file_level=args.debug_file_level,
+        )
+    else:
+        # 禁用所有调试日志
+        setup_model_logging(log_to_console=False, log_to_file=False)
+    # ======================================
+
     # 使用您重构后的新环境
     new_task = LayupTask.LAYUP.get_from_yaml() 
 
     attacker_algorithm_config = MappoConfig.get_from_yaml()
     attacker_algorithm_config.share_param_actor = False
-    attacker_algorithm_config.share_param_critic = False
+    attacker_algorithm_config.share_param_critic = True
     defender_algorithm_config = MappoConfig.get_from_yaml()
     defender_algorithm_config.share_param_actor = True
     defender_algorithm_config.share_param_critic = True
-    print(attacker_algorithm_config,defender_algorithm_config)
+    print(f"attacker algo: {attacker_algorithm_config}")
+    print(f"defender algo: {defender_algorithm_config}")
     algorithm_config = EnsembleAlgorithmConfig({"attacker":attacker_algorithm_config, "defender":defender_algorithm_config})
-    algorithm_config = MappoConfig.get_from_yaml()
+    # algorithm_config = MappoConfig.get_from_yaml()
     attacker_model_config = SequenceModelConfig(
         model_configs=[
             AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_attacker.yaml"),
@@ -391,6 +600,15 @@ if __name__ == '__main__':
     # defender_model_config = AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_defender.yaml")
     model_config = EnsembleModelConfig({"attacker":attacker_model_config, "defender":defender_model_config})
     critic_model_config = AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_critic.yaml")
+    # critic_model_config = SequenceModelConfig(
+    #     model_configs=[
+    #         AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_critic.yaml"),
+    #         GruConfig.get_from_yaml(),
+    #     ],
+    #     intermediate_sizes=[
+    #         128
+    #     ],  # Nuber of intermediate outputs. List of size n_layers - 1
+    # )
     
     # mamba
     # model_config = MambaConfig.get_from_yaml()
@@ -409,59 +627,12 @@ if __name__ == '__main__':
         critic_model_config=critic_model_config,
         seed=114514,
         config=experiment_config,
-        callbacks=[WinRateReportDebounced(),HealthCheckCallback()]
+        callbacks=[WinRateReportDebounced()]
     )
-    print("New experiment created with fresh training states (optimizers, buffers, etc.).")
+    print("New experiment created.\n")
 
-    # # 手动将预训练权重加载到新实验的模型中,actor和critic都恢复
-    # # 遍历新实验中的每一个智能体组
-    # for group in experiment.group_map.keys():
-    #     if group == "attacker" :
-    #         loss_key = f"loss_{group}"
-    #         if loss_key in checkpoint:
-    #             print(f"Loading weights for group '{group}' from '{loss_key}'...")
-    #             # experiment.losses[group] 是一个 LossModule，它包含了actor和critic网络
-    #             # 加载它的状态字典，就会恢复网络的权重
-    #             experiment.losses[group].load_state_dict(checkpoint[loss_key])
-    #             print(f"Successfully loaded weights for group '{group}'.")
-    #         else:
-    #             print(f"Warning: No weights found for group '{group}' in the checkpoint. Using freshly initialized weights.")
-    
-    
-    # 只恢复 actor 网络不恢复 critic
-    # ACTOR_PREFIX = "actor_network_params."
-    # for group in experiment.group_map.keys():
-    #     if group == "attacker" :
-    #         loss_key = f"loss_{group}"
-    #         if loss_key in checkpoint:
-    #             print(f"Partially loading ONLY ACTOR weights for group '{group}'...")
-
-    #             # 1. 从 checkpoint 中获取该 group 的完整状态字典
-    #             full_group_state_dict = checkpoint[loss_key]
-
-    #             # 2. 筛选出 actor 的所有参数（不再检查类型），并移除key的前缀
-    #             #    这样就会把 __batch_size (torch.Size) 和 __device (NoneType) 也包含进来
-    #             actor_state_dict = {
-    #                 key.removeprefix(ACTOR_PREFIX): value
-    #                 for key, value in full_group_state_dict.items()
-    #                 if key.startswith(ACTOR_PREFIX)
-    #             }
-
-    #             # 3. 将筛选后的 state_dict 加载到 actor 网络中
-    #             try:
-    #                 actor_network = experiment.losses[group].actor_network_params
-                    
-    #                 # 使用 strict=False 增加加载的灵活性，这是一个好习惯
-    #                 # 它会加载所有匹配的键，并忽略不匹配的键，从而避免因细微差异导致的错误
-    #                 actor_network.load_state_dict(actor_state_dict, strict=False)
-                    
-    #                 print(f"Successfully loaded actor weights for group '{group}'.")
-    #             except AttributeError:
-    #                 print(f"[Error] Could not find attribute 'actor_network_params' in LossModule for group '{group}'. Please check the model definition.")
-    #             except Exception as e:
-    #                 print(f"[Error] Failed to load weights for group '{group}': {e}")
-
-    print("The optimizer, replay buffer, and collector states remain freshly initialized as intended.")
+    # 对于非cont模式，手动应用部分checkpoint加载
+    apply_partial_checkpoint(experiment, checkpoint, args.mode)
 
     # 5. 开始在新环境上训练
     print("\nStarting training on the new environment...")
