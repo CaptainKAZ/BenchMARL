@@ -3,7 +3,7 @@
 # --- 配置区域 ---
 PYTHON_FILE="clear_restore.py"  # 你的 Python 文件名
 MAX_RUNS=10              # 最大运行次数
-TRAINING_MODE="cold"     # 训练模式: cold, cont, atk-c, def-c, atk-a, def-a, both-a
+TRAINING_MODE="$1"     # 训练模式: cold, cont, atk-c, def-c, atk-a, def-a, both-a
 # --- --- --- ---
 
 n=0

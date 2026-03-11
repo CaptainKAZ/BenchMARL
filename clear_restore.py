@@ -344,17 +344,21 @@ def parse_args():
         epilog="""
 训练模式:
   cold        从零开始 (默认)
-  cont        继续训练所有组
-  atk-c       保留attacker critic
-  def-c       保留defender critic
+  cont        继续训练所有组 (actor + critic + optimizer + buffer)
   atk-a       只加载attacker actor
   def-a       只加载defender actor
   both-a      加载双方actor
+  atk-c       保留attacker critic (旧命名，建议使用atk-ac)
+  def-c       保留defender critic (旧命名，建议使用def-ac)
+  atk-ac      加载attacker的actor + critic
+  def-ac      加载defender的actor + critic
+  both-ac     加载双方的actor + critic
 
 示例:
   python clear_restore.py -m cold
   python clear_restore.py -m cont
   python clear_restore.py -m atk-a -c outputs/xxx/checkpoint.pt
+  python clear_restore.py -m both-ac
         """
     )
 
@@ -362,7 +366,7 @@ def parse_args():
         '-m', '--mode',
         type=str,
         default='cold',
-        choices=['cold', 'cont', 'atk-c', 'def-c', 'atk-a', 'def-a', 'both-a'],
+        choices=['cold', 'cont', 'atk-a', 'def-a', 'both-a', 'atk-c', 'def-c', 'atk-ac', 'def-ac', 'both-ac'],
         help='训练模式'
     )
 
@@ -437,8 +441,8 @@ def load_checkpoint_for_mode(experiment_config, mode, checkpoint_path, pattern):
     if mode == 'cold':
         print("\n[COLD START] Starting fresh training.\n")
         # Cold start: 设置宽松的初始 shot threshold
-        os.environ['VMAS_INITIAL_SHOT_THRESHOLD'] = '0.6'
-        print("[ENV] Set VMAS_INITIAL_SHOT_THRESHOLD = 0.6 (lenient for cold start)")
+        os.environ['VMAS_INITIAL_SHOT_THRESHOLD'] = '1.2'
+        print("[ENV] Set VMAS_INITIAL_SHOT_THRESHOLD = 1.2 (lenient for cold start)")
         return None
 
     # 确定checkpoint路径
@@ -496,15 +500,15 @@ def apply_partial_checkpoint(experiment, checkpoint, mode):
     if checkpoint is None:
         return
 
-    if mode == 'atk-c':
-        print("[ATK-C] Attacker full + Defender fresh...")
+    if mode == 'atk-c' or mode == 'atk-ac':
+        print(f"[{mode.upper()}] Attacker full + Defender fresh...")
         if "loss_attacker" in checkpoint:
             experiment.losses["attacker"].load_state_dict(checkpoint["loss_attacker"])
             print("  ✓ Attacker (actor + critic)")
         print("  ✓ Defender fresh")
 
-    elif mode == 'def-c':
-        print("[DEF-C] Defender full + Attacker fresh...")
+    elif mode == 'def-c' or mode == 'def-ac':
+        print(f"[{mode.upper()}] Defender full + Attacker fresh...")
         if "loss_defender" in checkpoint:
             experiment.losses["defender"].load_state_dict(checkpoint["loss_defender"])
             print("  ✓ Defender (actor + critic)")
@@ -522,6 +526,15 @@ def apply_partial_checkpoint(experiment, checkpoint, mode):
         print("[BOTH-A] Loading both actors...")
         load_actor_only(experiment, checkpoint, 'attacker')
         load_actor_only(experiment, checkpoint, 'defender')
+
+    elif mode == 'both-ac':
+        print("[BOTH-AC] Loading both groups (actor + critic)...")
+        if "loss_attacker" in checkpoint:
+            experiment.losses["attacker"].load_state_dict(checkpoint["loss_attacker"])
+            print("  ✓ Attacker (actor + critic)")
+        if "loss_defender" in checkpoint:
+            experiment.losses["defender"].load_state_dict(checkpoint["loss_defender"])
+            print("  ✓ Defender (actor + critic)")
 
     print("[DONE] Checkpoint loaded!\n")
 
@@ -570,7 +583,7 @@ if __name__ == '__main__':
 
     attacker_algorithm_config = MappoConfig.get_from_yaml()
     attacker_algorithm_config.share_param_actor = False
-    attacker_algorithm_config.share_param_critic = True
+    attacker_algorithm_config.share_param_critic = False
     defender_algorithm_config = MappoConfig.get_from_yaml()
     defender_algorithm_config.share_param_actor = True
     defender_algorithm_config.share_param_critic = True

@@ -69,6 +69,8 @@ class Attention(Model):
         self.use_ego_embedding = use_ego_embedding
         self.ignore_features = set(ignore_features) if ignore_features else set()
         self.encoder_groups_config = encoder_groups or {}
+        compile_attention_blocks = kwargs.pop('compile_attention_blocks', False)
+        compile_mode = kwargs.pop('compile_mode', 'default')
 
         # ✅ 解析输入切片（_perform_checks 需要 total_expected_dim）
         self._parse_input_slices()
@@ -105,8 +107,28 @@ class Attention(Model):
                 for _ in range(num_attention_layers)
             ])
 
+        if compile_attention_blocks:
+            if not self.share_params:
+                # 编译每个 agent 的每一层
+                for agent_idx in range(self.n_agents):
+                    for layer_idx in range(num_attention_layers):
+                        self.attention_layers[agent_idx][layer_idx] = torch.compile(
+                            self.attention_layers[agent_idx][layer_idx],
+                            mode=compile_mode
+                        )
+            else:
+                # 编译共享层
+                for layer_idx in range(num_attention_layers):
+                    self.attention_layers[layer_idx] = torch.compile(
+                        self.attention_layers[layer_idx],
+                        mode=compile_mode
+                    )
+
         # 输出 MLP（✅ 使用 MultiAgentMLP）
         self._init_final_mlp(final_mlp_hidden_layers)
+
+        # ✅ [NEW] 预计算 forward 中需要的固定值（修复 1）
+        self._precompute_constants()
 
     def _parse_input_slices(self):
         self.slices = {}
@@ -126,6 +148,47 @@ class Attention(Model):
         actual_dim = self.input_spec[self.in_key].shape[-1]
         if self.total_expected_dim != actual_dim:
             raise ValueError(f"Attention 配置维度 {self.total_expected_dim} 与输入 Spec {actual_dim} 不符。")
+
+    def _precompute_constants(self):
+        """✅ [NEW] 预计算 forward 中需要的所有固定值（修复 1）"""
+        # 1. 实体特征的有序列表（排除 ignore）
+        self._entity_names_ordered = [
+            n for n in self.input_feature_order
+            if n in self.roles.get('entity', [])
+            and n not in self.ignore_features
+        ]
+
+        # 2. 全局特征的有序列表
+        self._global_names_ordered = [
+            n for n in self.roles.get('global', [])
+            if n not in self.ignore_features
+        ]
+
+        # 3. 实体总数
+        self._num_entities = sum(
+            self.definitions[n]['num']
+            for n in self._entity_names_ordered
+        )
+
+        # 4. 全局特征总维度
+        self._global_dim = sum(
+            self.definitions[n]['dim'] * self.definitions[n]['num']
+            for n in self._global_names_ordered
+        )
+
+        # 5. 输出特征维度（聚合后）
+        if self.use_ego_embedding:
+            self._aggregated_dim = self.embedding_dim
+        else:
+            self._aggregated_dim = self._num_entities * self.embedding_dim
+
+        # 6. 全局特征拼接模式（静态决定）
+        if self.input_has_agent_dim and not self.output_has_agent_dim:
+            self._global_concat_mode = 0
+        elif not self.input_has_agent_dim and self.output_has_agent_dim:
+            self._global_concat_mode = 1
+        else:
+            self._global_concat_mode = 2
 
     def _init_encoders(self):
         """✅ 正确处理参数共享：share_params=False 时为每个 agent 创建独立编码器"""
@@ -247,24 +310,25 @@ class Attention(Model):
             debug_print(self.name, "Features after removing agent dim", features)
 
         # 5. 拼接全局特征
-        global_tensors = [input_tensor[..., self.slices[n]]
-                          for n in self.roles.get('global', [])
-                          if n not in self.ignore_features]
-        if global_tensors:
-            # ✅ 修正：处理全局特征的维度兼容性
-            if self.input_has_agent_dim and not self.output_has_agent_dim:
+        # ✅ 使用预计算的全局特征列表和拼接模式（修复 1.2）
+        if self._global_dim > 0:
+            # 提取全局特征
+            if len(self._global_names_ordered) == 1:
+                global_cat = input_tensor[..., self.slices[self._global_names_ordered[0]]]
+            else:
+                global_tensors = [input_tensor[..., self.slices[n]] for n in self._global_names_ordered]
                 global_cat = torch.cat(global_tensors, dim=-1)
+
+            # ✅ 使用预计算的拼接模式（避免运行时分支）
+            if self._global_concat_mode == 0:  # input_agent & ~output_agent
                 global_cat = global_cat[..., 0, :]
-                features = torch.cat([features, global_cat], dim=-1)
-            elif not self.input_has_agent_dim and self.output_has_agent_dim:
-                global_cat = torch.cat(global_tensors, dim=-1)
+            elif self._global_concat_mode == 1:  # ~input_agent & output_agent
                 global_cat = global_cat.unsqueeze(-2).expand(
                     *global_cat.shape[:-1], self.n_agents, global_cat.shape[-1]
                 )
-                features = torch.cat([features, global_cat], dim=-1)
-            else:
-                features = torch.cat([features, *global_tensors], dim=-1)
+            # else: mode == 2, 维度已经对齐，无需变换
 
+            features = torch.cat([features, global_cat], dim=-1)
             debug_print(self.name, "Features after global concat", features)
 
         # 6. MLP 输出
@@ -292,10 +356,8 @@ class Attention(Model):
 
         # 2. Embedding 处理
         embedded_entities = []
-        for name in self.input_feature_order:
-            if name not in self.roles.get('entity', []) or name in self.ignore_features:
-                continue
-
+        # ✅ 使用预计算的实体列表（修复 1.2）
+        for name in self._entity_names_ordered:
             raw = input_tensor[..., self.slices[name]]
             d = self.definitions[name]
             entity_data = raw.view(*raw.shape[:-1], d['num'], d['dim'])
@@ -355,10 +417,8 @@ class Attention(Model):
             agent_outputs = []
             for agent_idx in range(self.n_agents):
                 embedded_entities = []
-                for name in self.input_feature_order:
-                    if name not in self.roles.get('entity', []) or name in self.ignore_features:
-                        continue
-
+                # ✅ 使用预计算的实体列表（修复 1.2）
+                for name in self._entity_names_ordered:
                     raw = input_tensor[..., self.slices[name]]
                     d = self.definitions[name]
                     entity_data = raw.view(*raw.shape[:-1], d['num'], d['dim'])
@@ -403,10 +463,8 @@ class Attention(Model):
             # share_params=True: 所有 agent 使用相同的编码器和注意力层
             # 首先编码实体
             embedded_entities = []
-            for name in self.input_feature_order:
-                if name not in self.roles.get('entity', []) or name in self.ignore_features:
-                    continue
-
+            # ✅ 使用预计算的实体列表（修复 1.2）
+            for name in self._entity_names_ordered:
                 raw = input_tensor[..., self.slices[name]]
                 d = self.definitions[name]
                 entity_data = raw.view(*raw.shape[:-1], d['num'], d['dim'])
@@ -462,10 +520,8 @@ class Attention(Model):
 
             # 2. Embedding 处理（使用当前 agent 的编码器）
             embedded_entities = []
-            for name in self.input_feature_order:
-                if name not in self.roles.get('entity', []) or name in self.ignore_features:
-                    continue
-
+            # ✅ 使用预计算的实体列表（修复 1.2）
+            for name in self._entity_names_ordered:
                 raw = agent_input[..., self.slices[name]]
                 d = self.definitions[name]
                 entity_data = raw.view(*raw.shape[:-1], d['num'], d['dim'])
@@ -532,6 +588,10 @@ class AttentionConfig(ModelConfig):
     ignore_features: List[str] = field(default_factory=list)
     share_params_override: Optional[bool] = None
     share_params_final_mlp: Optional[bool] = None
+
+    # ✅ 编译配置（学习自 GRU）
+    compile_attention_blocks: bool = True  # 是否编译 AttentionBlock
+    compile_mode: str = "default"  # 编译模式: "default", "reduce-overhead", "max-autotune"
 
     @staticmethod
     def associated_class() -> Type[Model]:

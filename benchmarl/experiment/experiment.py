@@ -48,7 +48,7 @@ from benchmarl.utils import (
 )
 import multiprocessing
 from torch.profiler import profile, record_function, ProfilerActivity
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import autocast, GradScaler
 from tensordict.nn import set_composite_lp_aggregate
 
 _has_hydra = importlib.util.find_spec("hydra") is not None
@@ -133,6 +133,12 @@ class ExperimentConfig:
     amp_dtype: str = MISSING  # "float16" or "bfloat16"
 
     evaluation_device: str = "cpu"
+
+    # Learning rate scheduler
+    lr_scheduler: str = "constant"  # Options: constant, linear, cosine, exponential
+    lr_scheduler_min_lr: float = 0.0  # Minimum learning rate for linear/cosine
+    lr_scheduler_gamma: float = 0.99  # Decay factor for exponential
+    lr_scheduler_T_max: Optional[int] = None  # Number of iterations for decay (None = use max_n_iters)
 
     def train_batch_size(self, on_policy: bool) -> int:
         """
@@ -740,6 +746,40 @@ class Experiment(CallbackNotifier):
         else:
             self.amp_dtype = torch.float32
 
+        # Initialize learning rate schedulers
+        self.lr_schedulers = {}
+        if self.config.lr_scheduler != "constant":
+            # Use manual T_max if specified, otherwise use max_n_iters
+            max_iters = self.config.lr_scheduler_T_max if self.config.lr_scheduler_T_max is not None else self.config.get_max_n_iters(self.on_policy)
+            for group in self.group_map.keys():
+                schedulers_for_group = {}
+                for loss_name, optimizer in self.optimizers[group].items():
+                    if self.config.lr_scheduler == "linear":
+                        # Linear decay from lr to min_lr
+                        scheduler = torch.optim.lr_scheduler.LinearLR(
+                            optimizer,
+                            start_factor=1.0,
+                            end_factor=self.config.lr_scheduler_min_lr / self.config.lr if self.config.lr > 0 else 0.0,
+                            total_iters=max_iters,
+                        )
+                    elif self.config.lr_scheduler == "cosine":
+                        # Cosine annealing
+                        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                            optimizer,
+                            T_max=max_iters,
+                            eta_min=self.config.lr_scheduler_min_lr,
+                        )
+                    elif self.config.lr_scheduler == "exponential":
+                        # Exponential decay
+                        scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                            optimizer,
+                            gamma=self.config.lr_scheduler_gamma,
+                        )
+                    else:
+                        scheduler = None
+                    schedulers_for_group[loss_name] = scheduler
+                self.lr_schedulers[group] = schedulers_for_group
+
     def _setup_collector(self):
         self.policy = self.algorithm.get_policy_for_collection()
 
@@ -928,6 +968,8 @@ class Experiment(CallbackNotifier):
         ):
             iteration_start = time.time()
             torch.cuda.empty_cache()
+            if not self.config.collect_with_grad:
+                self.collector.update_policy_weights_()
             self.policy.eval()
             if not self.config.collect_with_grad:
                 batch = next(iterator)
@@ -1005,6 +1047,12 @@ class Experiment(CallbackNotifier):
             # Update policy in collector
             if not self.config.collect_with_grad:
                 self.collector.update_policy_weights_()
+            # Learning rate scheduler step
+            for group in self.train_group_map.keys():
+                if group in self.lr_schedulers:
+                    for scheduler in self.lr_schedulers[group].values():
+                        if scheduler is not None:
+                            scheduler.step()
             # Training timer
             training_time = time.time() - training_start
 
@@ -1266,6 +1314,20 @@ class Experiment(CallbackNotifier):
                 for k, scaler in self.grad_scalers.items()
             })
 
+        # Save optimizer state
+        for group in self.group_map.keys():
+            state_dict[f"optimizer_{group}"] = {
+                name: opt.state_dict() for name, opt in self.optimizers[group].items()
+            }
+
+        # Save learning rate scheduler state
+        if self.config.lr_scheduler != "constant":
+            for group in self.group_map.keys():
+                state_dict[f"lr_scheduler_{group}"] = {
+                    name: sched.state_dict() if sched is not None else None
+                    for name, sched in self.lr_schedulers[group].items()
+                }
+
         return state_dict
 
     def load_state_dict(self, state_dict: Dict) -> None:
@@ -1287,6 +1349,21 @@ class Experiment(CallbackNotifier):
                 scaler_key = f"grad_scaler_{group}"
                 if scaler_key in state_dict:
                     self.grad_scalers[group].load_state_dict(state_dict[scaler_key])
+
+            # Load optimizer state
+            opt_key = f"optimizer_{group}"
+            if opt_key in state_dict:
+                for name, opt_state in state_dict[opt_key].items():
+                    if name in self.optimizers[group]:
+                        self.optimizers[group][name].load_state_dict(opt_state)
+
+            # Load learning rate scheduler state
+            if self.config.lr_scheduler != "constant":
+                sched_key = f"lr_scheduler_{group}"
+                if sched_key in state_dict and group in self.lr_schedulers:
+                    for name, sched_state in state_dict[sched_key].items():
+                        if sched_state is not None and name in self.lr_schedulers[group]:
+                            self.lr_schedulers[group][name].load_state_dict(sched_state)
 
         if not self.config.collect_with_grad:
             self.collector.load_state_dict(state_dict["collector"])
