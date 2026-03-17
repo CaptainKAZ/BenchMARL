@@ -32,14 +32,11 @@ use_ego_embedding: True
 # 只有物理维度相同、且逻辑相似的实体才应该放在一组。
 # 代码会自动为组内的特征拼接 One-Hot ID 以区分身份。
 
-# encoder_groups:
-#   # --- 组 1: 动态单位 (Players) ---
-#   # 它们都是 4 维 (x, y, vx, vy)，物理规律一致。
-#   # 共享同一个权重矩阵，利用 ID (0, 1, 2) 区分自我、队友、敌人。
-#   players:
-#     features:
-#       - teammate_embed
-#       - opponent_embed
+encoder_groups:
+  players:
+    features:
+      - teammate_embed
+      - opponent_embed
 
 # ------------------------------------------------------------------------------
 # 3. 忽略列表 (Ignore Features)
@@ -47,7 +44,6 @@ use_ego_embedding: True
 # 在这里列出的特征会被直接丢弃，不进入网络。
 # 适用于：全 0 的 Padding 数据、你不希望 Agent 看到的作弊数据等。
 ignore_features:
-  # - dummy_padding_zeros  # 示例：假设你有这个废弃特征
 
 # ------------------------------------------------------------------------------
 # 4. 输入特征解析 (Input Parsing)
@@ -56,12 +52,14 @@ ignore_features:
 # 4.1. 特征顺序
 # 【非常重要】如果 use_ego_embedding: True，请务必保证 'self_embed' 排在第一个！
 # 这样它才会对应 Sequence Index 0。
+# 新观测结构 (39维): 每个非自己agent 8维 (相对位置+相对速度+绝对位置+绝对速度)
+# spot和basket各4维 (相对位置+绝对位置)
 input_feature_order:
   - self_embed        # -> Index 0 (7维, Ego Token)
-  - teammate_embed    # -> Index 1 (4维)
-  - opponent_embed    # -> Index 2, 3 (4维, 共2个)
-  - spot_embed        # -> Index 4 (3维)
-  - basket_embed      # -> Index 5 (2维)
+  - teammate_embed    # -> Index 1 (8维)
+  - opponent_embed    # -> Index 2, 3 (8维, 共2个)
+  - spot_embed        # -> Index 4 (4维)
+  - basket_embed      # -> Index 5 (4维)
 
 # 4.2. 角色分配
 roles:
@@ -79,11 +77,9 @@ roles:
 
 # 4.3. 维度定义 (必须与环境 Observation 一致)
 definitions:
-  # --- 组 1: Players (Raw Dim 必须一致，这里都是 4) ---
   self_embed:     { dim: 7, num: 1 }
-  teammate_embed: { dim: 4, num: 1 }
-  opponent_embed: { dim: 4, num: 2 }
+  teammate_embed: { dim: 8, num: 1 }
+  opponent_embed: { dim: 8, num: 2 }
 
-  # --- 异构实体 (维度各不相同) ---
-  spot_embed:     { dim: 2, num: 1 } # x, y
-  basket_embed:   { dim: 2, num: 1 } # x, y
+  spot_embed:     { dim: 4, num: 1 }
+  basket_embed:   { dim: 4, num: 1 }

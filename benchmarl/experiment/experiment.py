@@ -138,7 +138,9 @@ class ExperimentConfig:
     lr_scheduler: str = "constant"  # Options: constant, linear, cosine, exponential
     lr_scheduler_min_lr: float = 0.0  # Minimum learning rate for linear/cosine
     lr_scheduler_gamma: float = 0.99  # Decay factor for exponential
-    lr_scheduler_T_max: Optional[int] = None  # Number of iterations for decay (None = use max_n_iters)
+    lr_scheduler_T_max: Optional[int] = (
+        None  # Number of iterations for decay (None = use max_n_iters)
+    )
 
     def train_batch_size(self, on_policy: bool) -> int:
         """
@@ -355,7 +357,7 @@ def _evaluation_worker(
     eval_device = torch.device("cpu")
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     seed_everything(seed)
-    
+
     # --- 1. 初始化阶段 (仅执行一次) ---
     # 创建环境
     test_env = task.get_env_fun(
@@ -364,7 +366,7 @@ def _evaluation_worker(
         seed=seed,
         device=eval_device,
     )()
-    
+
     # 提取 Specs
     observation_spec = task.observation_spec(test_env)
     action_spec = task.action_spec(test_env)
@@ -397,7 +399,6 @@ def _evaluation_worker(
             aglo.device = torch.device("cpu")
     else:
         algorithm.device = torch.device("cpu")
-    
 
     # 环境转换
     transforms_env = Compose(*task.get_env_transforms(test_env))
@@ -429,10 +430,11 @@ def _evaluation_worker(
         try:
             # 尝试获取新权重，设置超时以便检查 stop_event
             data = weight_queue.get(timeout=1.0)
-            if data is None: break  # 收到结束信号
-            
+            if data is None:
+                break  # 收到结束信号
+
             policy_state_dict, total_frames, n_iters_performed = data
-            
+
             # 更新权重
             eval_policy.load_state_dict(policy_state_dict)
             eval_policy.eval()
@@ -448,8 +450,11 @@ def _evaluation_worker(
                     # 渲染回调处理
                     if task.has_render(test_env) and experiment_config.render:
                         video_frames = []
+
                         def callback(env, td):
-                            video_frames.append(task.__class__.render_callback(exp_shell, env, td))
+                            video_frames.append(
+                                task.__class__.render_callback(exp_shell, env, td)
+                            )
                     else:
                         video_frames = None
                         callback = None
@@ -457,31 +462,50 @@ def _evaluation_worker(
                     # 执行 Rollout
                     if test_env.batch_size == ():
                         rollouts = []
-                        for eval_episode in range(experiment_config.evaluation_episodes):
-                            rollouts.append(test_env.rollout(
-                                max_steps=max_steps, policy=eval_policy,
-                                callback=callback if eval_episode == 0 else None,
-                                auto_cast_to_device=True, break_when_any_done=False,
-                            ))
+                        for eval_episode in range(
+                            experiment_config.evaluation_episodes
+                        ):
+                            rollouts.append(
+                                test_env.rollout(
+                                    max_steps=max_steps,
+                                    policy=eval_policy,
+                                    callback=callback if eval_episode == 0 else None,
+                                    auto_cast_to_device=True,
+                                    break_when_any_done=False,
+                                )
+                            )
                     else:
                         rollouts = test_env.rollout(
-                            max_steps=max_steps, policy=eval_policy,
-                            callback=callback, auto_cast_to_device=True, break_when_any_done=False,
+                            max_steps=max_steps,
+                            policy=eval_policy,
+                            callback=callback,
+                            auto_cast_to_device=True,
+                            break_when_any_done=False,
                         )
                         rollouts = list(rollouts.unbind(0))
 
             # 日志记录
             evaluation_time = time.time() - evaluation_start
-            logger.log({"timers/evaluation_time": evaluation_time}, step=n_iters_performed)
-            logger.log_evaluation(rollouts, video_frames=video_frames, step=n_iters_performed, total_frames=total_frames)
+            logger.log(
+                {"timers/evaluation_time": evaluation_time}, step=n_iters_performed
+            )
+            logger.log_evaluation(
+                rollouts,
+                video_frames=video_frames,
+                step=n_iters_performed,
+                total_frames=total_frames,
+            )
             logger.commit()
-            print(f"[Eval Worker]: Iteration {n_iters_performed} evaluation finished on CPU.")
+            print(
+                f"[Eval Worker]: Iteration {n_iters_performed} evaluation finished on CPU."
+            )
 
-        except Exception: # 处理队列为空或超时的正常情况
+        except Exception:  # 处理队列为空或超时的正常情况
             continue
 
     test_env.close()
     logger.finish()
+
 
 class Experiment(CallbackNotifier):
     """
@@ -511,7 +535,6 @@ class Experiment(CallbackNotifier):
         critic_model_config: Optional[ModelConfig] = None,
         callbacks: Optional[List[Callback]] = None,
     ):
-
         multiprocessing.set_start_method("spawn", force=True)
         super().__init__(
             experiment=self, callbacks=callbacks if callbacks is not None else []
@@ -544,16 +567,16 @@ class Experiment(CallbackNotifier):
         self.n_iters_performed = 0
         self.mean_return = 0
 
-        self.eval_weight_queue = multiprocessing.Queue(maxsize=1) # 保证只评估最新的
+        self.eval_weight_queue = multiprocessing.Queue(maxsize=1)  # 保证只评估最新的
         self.eval_stop_event = multiprocessing.Event()
         self.evaluation_process = None
-        
+
         if self.config.evaluation:
             self._start_evaluation_worker()
 
         if self.config.restore_file is not None:
             self._load_experiment()
-    
+
     def _start_evaluation_worker(self):
         # 准备静态参数
         args = (
@@ -573,7 +596,7 @@ class Experiment(CallbackNotifier):
         self.evaluation_process = multiprocessing.Process(
             target=_evaluation_worker,
             args=args,
-            daemon=True # 随主进程退出
+            daemon=True,  # 随主进程退出
         )
         self.evaluation_process.start()
 
@@ -727,7 +750,10 @@ class Experiment(CallbackNotifier):
         self.optimizers = {
             group: {
                 loss_name: torch.optim.AdamW(
-                    params, lr=self.config.lr, eps=self.config.adam_eps, weight_decay=1e-4
+                    params,
+                    lr=self.config.lr,
+                    eps=self.config.adam_eps,
+                    weight_decay=1e-4,
                 )
                 for loss_name, params in self.algorithm.get_parameters(group).items()
             }
@@ -738,7 +764,9 @@ class Experiment(CallbackNotifier):
         self.grad_scalers = {}
         if self.config.use_amp and self.config.train_device != "cpu":
             # Determine precision type
-            amp_dtype = torch.float16 if self.config.amp_dtype == "float16" else torch.bfloat16
+            amp_dtype = (
+                torch.float16 if self.config.amp_dtype == "float16" else torch.bfloat16
+            )
             self.amp_dtype = amp_dtype
 
             for group in self.group_map.keys():
@@ -750,7 +778,11 @@ class Experiment(CallbackNotifier):
         self.lr_schedulers = {}
         if self.config.lr_scheduler != "constant":
             # Use manual T_max if specified, otherwise use max_n_iters
-            max_iters = self.config.lr_scheduler_T_max if self.config.lr_scheduler_T_max is not None else self.config.get_max_n_iters(self.on_policy)
+            max_iters = (
+                self.config.lr_scheduler_T_max
+                if self.config.lr_scheduler_T_max is not None
+                else self.config.get_max_n_iters(self.on_policy)
+            )
             for group in self.group_map.keys():
                 schedulers_for_group = {}
                 for loss_name, optimizer in self.optimizers[group].items():
@@ -759,7 +791,9 @@ class Experiment(CallbackNotifier):
                         scheduler = torch.optim.lr_scheduler.LinearLR(
                             optimizer,
                             start_factor=1.0,
-                            end_factor=self.config.lr_scheduler_min_lr / self.config.lr if self.config.lr > 0 else 0.0,
+                            end_factor=self.config.lr_scheduler_min_lr / self.config.lr
+                            if self.config.lr > 0
+                            else 0.0,
                             total_iters=max_iters,
                         )
                     elif self.config.lr_scheduler == "cosine":
@@ -787,7 +821,7 @@ class Experiment(CallbackNotifier):
         for group in self.group_map.keys():
             # [修改开始] 支持复合动作键查找
             # 原代码: group_policy = self.policy.select_subsequence(out_keys=[(group, "action")])
-            
+
             target_keys = [(group, "action")]
             # 检查策略是否输出了更具体的子动作键 (e.g., ("agent", "action", "continuous"))
             # select_subsequence 需要精确匹配 out_keys
@@ -798,17 +832,21 @@ class Experiment(CallbackNotifier):
                 for key in policy_out_keys:
                     # key 可能是字符串或元组，统一处理
                     key_tuple = (key,) if isinstance(key, str) else key
-                    if len(key_tuple) > 2 and key_tuple[0] == group and key_tuple[1] == "action":
+                    if (
+                        len(key_tuple) > 2
+                        and key_tuple[0] == group
+                        and key_tuple[1] == "action"
+                    ):
                         specific_keys.append(key)
-                
+
                 if specific_keys:
                     target_keys = specific_keys
 
             group_policy = self.policy.select_subsequence(out_keys=target_keys)
-            
+
             # [修改] 移除长度断言，支持多模块序列
             # assert len(group_policy) == 1
-            
+
             # [修改] 存储整个序列，而不是只取第一个元素 [0]
             # 这样后续的 exploration check (explore_layer = group_policy[-1]) 才能正确获取到最后的 Actor
             self.group_policies.update({group: group_policy})
@@ -821,7 +859,9 @@ class Experiment(CallbackNotifier):
                     policy=self.policy,
                     device=self.config.sampling_device,
                     storing_device=self.config.sampling_device,
-                    frames_per_batch=self.config.collected_frames_per_batch(self.on_policy),
+                    frames_per_batch=self.config.collected_frames_per_batch(
+                        self.on_policy
+                    ),
                     total_frames=self.config.get_max_n_frames(self.on_policy),
                     init_random_frames=(
                         self.config.off_policy_init_random_frames
@@ -836,7 +876,9 @@ class Experiment(CallbackNotifier):
                     self.policy,
                     device=self.config.sampling_device,
                     storing_device=self.config.sampling_device,
-                    frames_per_batch=self.config.collected_frames_per_batch(self.on_policy),
+                    frames_per_batch=self.config.collected_frames_per_batch(
+                        self.on_policy
+                    ),
                     total_frames=self.config.get_max_n_frames(self.on_policy),
                     init_random_frames=(
                         self.config.off_policy_init_random_frames
@@ -1047,41 +1089,50 @@ class Experiment(CallbackNotifier):
             # Update policy in collector
             if not self.config.collect_with_grad:
                 self.collector.update_policy_weights_()
-            # Learning rate scheduler step
+            lr_log = {}
             for group in self.train_group_map.keys():
                 if group in self.lr_schedulers:
-                    for scheduler in self.lr_schedulers[group].values():
+                    for loss_name, scheduler in self.lr_schedulers[group].items():
                         if scheduler is not None:
                             scheduler.step()
+                            current_lr = scheduler.get_last_lr()[0]
+                            lr_log[f"lr/{group}/{loss_name}"] = current_lr
+            if lr_log:
+                self.logger.log(lr_log, step=self.n_iters_performed)
             # Training timer
             training_time = time.time() - training_start
 
             # Evaluation
             if (
                 self.config.evaluation
-                and (self.total_frames % self.config.evaluation_interval == 0 or self.n_iters_performed == 0)
+                and (
+                    self.total_frames % self.config.evaluation_interval == 0
+                    or self.n_iters_performed == 0
+                )
                 and (len(self.config.loggers) or self.config.create_json)
             ):
                 # 将策略拷贝到 CPU 并序列化
                 # 使用 state_dict() 时加上 .to("cpu") 确保子进程不触碰 CUDA
                 policy_state_dict = {
-                    k: v.cpu().detach() if isinstance(v, torch.Tensor) else v 
+                    k: v.cpu().detach() if isinstance(v, torch.Tensor) else v
                     for k, v in self.policy.state_dict().items()
                 }
-                
+
                 # 尝试推送到队列（非阻塞）
                 try:
                     # 如果队列满了（旧的还没评完），先弹出旧的再放新的，保证评估的是最新权重
                     if self.eval_weight_queue.full():
-                        try: self.eval_weight_queue.get_nowait()
-                        except: pass
-                    
-                    self.eval_weight_queue.put_nowait((
-                        policy_state_dict, 
-                        self.total_frames, 
-                        self.n_iters_performed
-                    ))
-                    print(f"\n[Main]: Sent weights for iteration {self.n_iters_performed} to Eval Worker.")
+                        try:
+                            self.eval_weight_queue.get_nowait()
+                        except:
+                            pass
+
+                    self.eval_weight_queue.put_nowait(
+                        (policy_state_dict, self.total_frames, self.n_iters_performed)
+                    )
+                    print(
+                        f"\n[Main]: Sent weights for iteration {self.n_iters_performed} to Eval Worker."
+                    )
                 except Exception as e:
                     warnings.warn(f"Could not send weights to evaluation worker: {e}")
                 # self._evaluation_loop()
@@ -1119,7 +1170,7 @@ class Experiment(CallbackNotifier):
         if self.evaluation_process is not None:
             print("Terminating background evaluation worker...")
             self.eval_stop_event.set()
-            self.eval_weight_queue.put(None) # 发送特殊信号
+            self.eval_weight_queue.put(None)  # 发送特殊信号
             self.evaluation_process.join(timeout=5)
             if self.evaluation_process.is_alive():
                 self.evaluation_process.terminate()
@@ -1147,7 +1198,7 @@ class Experiment(CallbackNotifier):
 
         # 1. Forward pass (with mixed precision if enabled)
         if self.config.use_amp and self.config.train_device != "cpu":
-            with autocast(device_type='cuda', dtype=self.amp_dtype):
+            with autocast(device_type="cuda", dtype=self.amp_dtype):
                 loss_vals = self.losses[group](subdata)
         else:
             loss_vals = self.losses[group](subdata)
@@ -1309,10 +1360,12 @@ class Experiment(CallbackNotifier):
 
         # Save GradScaler state for mixed precision training
         if self.config.use_amp and self.config.train_device != "cpu":
-            state_dict.update({
-                f"grad_scaler_{k}": scaler.state_dict()
-                for k, scaler in self.grad_scalers.items()
-            })
+            state_dict.update(
+                {
+                    f"grad_scaler_{k}": scaler.state_dict()
+                    for k, scaler in self.grad_scalers.items()
+                }
+            )
 
         # Save optimizer state
         for group in self.group_map.keys():
@@ -1362,7 +1415,10 @@ class Experiment(CallbackNotifier):
                 sched_key = f"lr_scheduler_{group}"
                 if sched_key in state_dict and group in self.lr_schedulers:
                     for name, sched_state in state_dict[sched_key].items():
-                        if sched_state is not None and name in self.lr_schedulers[group]:
+                        if (
+                            sched_state is not None
+                            and name in self.lr_schedulers[group]
+                        ):
                             self.lr_schedulers[group][name].load_state_dict(sched_state)
 
         if not self.config.collect_with_grad:
