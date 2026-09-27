@@ -19,11 +19,18 @@ from torchrl.modules import MLP, MultiAgentMLP
 from benchmarl.models.common import Model, ModelConfig
 from benchmarl.utils import DEVICE_TYPING
 
-# 尝试导入 Mamba2
+# 尝试导入 Mamba2（可选依赖）
+# 未安装 mamba_ssm 时不再中断 benchmarl 的整体导入，只有真正实例化 Mamba 模型时才报错。
+# 这样默认的 Attention + GRU 训练无需安装 mamba-ssm（其需要现场编译 CUDA 扩展，代价很高）。
 try:
     from mamba_ssm import Mamba2
+
+    _MAMBA_IMPORT_ERROR = None
 except ImportError:
-    raise ImportError("请先安装 mamba_ssm: `pip install mamba-ssm`")
+    Mamba2 = None
+    _MAMBA_IMPORT_ERROR = (
+        "未安装 mamba_ssm，无法使用 Mamba 模型。请先执行: pip install mamba-ssm"
+    )
 
 
 class MultiAgentMamba(nn.Module):
@@ -42,6 +49,8 @@ class MultiAgentMamba(nn.Module):
         share_params: bool,
     ):
         super().__init__()
+        if Mamba2 is None:
+            raise ImportError(_MAMBA_IMPORT_ERROR)
         self.d_model = d_model
         self.n_agents = n_agents
         self.device = device
