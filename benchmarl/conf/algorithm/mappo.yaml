@@ -6,11 +6,27 @@ defaults:
 
 share_param_critic: True
 clip_epsilon: 0.2
-entropy_coef: 0.05
-critic_coef: 0.8
+# [修复] 这两个值自 v6 起实际未生效过：mappo.py 曾把参数名写成双 f (entropy_coeff/
+# critic_coeff)，被 torchrl 的 ClipPPOLoss 静默丢弃，实际一直用默认值 0.01 / 1.0。
+# 现已改回单 f（见 mappo.py _get_loss），此处显式写回与历史实际一致的值：
+# 下次启动后本文件中的值才会真正生效。若要恢复"原本想用的" 0.05 / 0.8，直接改这里即可。
+entropy_coef: 0.01
+critic_coef: 1.0
 loss_critic_type: "smooth_l1"
 lmbda: 0.95
 scale_mapping: "biased_softplus_1.0"
 use_tanh_normal: True
 minibatch_advantage: True
 share_param_actor : False
+
+# [稳定化] 对 advantage 做标准化, 且保持 agent 维独立 (每个 agent 各自统计)。
+# 实测 raw advantage std 达 14~35, 远大于 grad clip=2.0, 会导致梯度大面积被裁剪。
+normalize_advantage: True
+normalize_advantage_exclude_dims: [-2]
+
+# [稳定化] 有界策略头 (仅 use_tanh_normal 时生效)。v27 NaN 的诱因之一是策略头 loc/scale 漂移,
+# 动作长期贴 tanh 饱和边界, 训练侧反解 log_prob 达 1e6 量级。限幅后 loc∈(−3,3)、scale∈(0.01,1.0)。
+bounded_tanh_params: True
+loc_bound: 3.0
+scale_min: 0.01
+scale_max: 1.0

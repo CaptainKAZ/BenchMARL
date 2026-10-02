@@ -248,12 +248,13 @@ class Logger:
 
         self.log(to_log, step=step)
         if video_frames is not None and max_length_rollout_0 > 1:
-            print("111111")
             video_frames = np.stack(video_frames[: max_length_rollout_0 - 1], axis=0)
             vid = torch.tensor(
                 np.transpose(video_frames, (0, 3, 1, 2)),
                 dtype=torch.uint8,
             ).unsqueeze(0)
+            # 尽早释放原始帧列表（约 0.7GB/次），避免与 tensor 拷贝叠加
+            video_frames = None
             for logger in self.loggers:
                 if isinstance(logger, WandbLogger):
                     logger.log_video("eval/video", vid, fps=10, commit=False)

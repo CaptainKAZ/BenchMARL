@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import copy
+import gc
 import importlib
 
 import os
+import tempfile
 import pickle
 import shutil
 import time
@@ -20,6 +22,7 @@ from pathlib import Path
 
 from typing import Any, Dict, List, Optional, Union
 
+import numpy as np
 import torch
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictSequential
@@ -30,6 +33,16 @@ from torchrl.envs.transforms import Compose
 from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
 from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
+
+# --- 线程安全的全局态补丁 ---------------------------------------------------
+# 把 tensordict/torchrl 的进程级上下文管理器（_interaction_type / _composite_lp_aggregate /
+# _skip_existing / recurrent_mode_state_manager）换成线程局部版本。
+# 否则重叠采集（OVERLAP_COLLECTION=1）时，训练线程在 loss 里设置的 DETERMINISTIC
+# 会被采集线程的 rollout 读到，污染采样的动作与 log-prob。
+from benchmarl.threadlocal_state import maybe_install_from_env as _maybe_install_tl_state
+
+_maybe_install_tl_state()
+# ---------------------------------------------------------------------------
 
 from benchmarl.algorithms.ensemble import EnsembleAlgorithm
 from benchmarl.algorithms import IppoConfig, MappoConfig
@@ -47,6 +60,7 @@ from benchmarl.utils import (
     seed_everything,
 )
 import multiprocessing
+import queue
 from torch.profiler import profile, record_function, ProfilerActivity
 from torch.amp import autocast, GradScaler
 from tensordict.nn import set_composite_lp_aggregate
@@ -54,6 +68,76 @@ from tensordict.nn import set_composite_lp_aggregate
 _has_hydra = importlib.util.find_spec("hydra") is not None
 if _has_hydra:
     from hydra.core.hydra_config import HydraConfig
+
+
+class _CollectionPrefetcher:
+    """[PERF] 后台线程预取采集批次，使 CPU 采集与 GPU 训练重叠执行。
+
+    安全性依据（已在容器内实测）：
+    - 采样设备 != 训练设备时，torchrl 会给 collector 建一个独立的目标设备策略副本
+      （collector.policy 是 CPU 副本，与训练侧 GPU 模块不共享张量），并配置
+      `VanillaWeightUpdater.weight_getter` 去取训练侧原始权重；因此
+      `collector.update_policy_weights_()` 会把训练侧权重拷贝进该 CPU 副本。
+    - 只要"同步权重"发生在后台采集结束之后、下一批采集开始之前，训练线程更新
+      GPU 权重与采集线程读取本地 CPU 副本之间就没有竞争。
+    语义：预取的下一批使用与当前批相同的权重（1 次迭代的滞后，PPO 可接受）。
+    """
+
+    def __init__(self, iterator, collector):
+        import threading
+
+        self._iterator = iterator
+        self._collector = collector
+        self._q = queue.Queue(maxsize=1)
+        self._go = threading.Event()
+        self._stop = threading.Event()
+        self._primed = False
+        self._thread = threading.Thread(
+            target=self._worker, name="benchmarl-prefetch-collect", daemon=True
+        )
+        self._thread.start()
+
+    def _worker(self):
+        try:
+            while not self._stop.is_set():
+                if not self._go.wait(timeout=0.5):
+                    continue
+                self._go.clear()
+                if self._stop.is_set():
+                    break
+                t0 = time.perf_counter()
+                batch = next(self._iterator)
+                if os.environ.get("OV_CLONE", "0") == "1":
+                    # [DIAG] 深拷贝：避免主线程消费该批次时，采集线程已在写入下一批（存储复用/别名）
+                    batch = batch.clone()
+                self._q.put((batch, time.perf_counter() - t0))
+        except BaseException as e:  # 采集异常转发给主线程重新抛出
+            try:
+                self._q.put(e)
+            except Exception:
+                pass
+
+    def get(self):
+        """阻塞获取预取批次；首次调用会先同步权重并启动后台采集。"""
+        if not self._primed:
+            self._collector.update_policy_weights_()
+            self._go.set()
+            self._primed = True
+        item = self._q.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def trigger_next(self):
+        """在"上一批已取回、下一批未开始"的窗口内同步权重并触发下一批预取。"""
+        self._collector.update_policy_weights_()
+        self._go.set()
+
+    def close(self):
+        self._stop.set()
+        self._go.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=10.0)
 
 
 @dataclass
@@ -356,6 +440,8 @@ def _evaluation_worker(
     # 强制使用 CPU
     eval_device = torch.device("cpu")
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # 评测保持 fp32：不启用 CPU bf16 采样加速，保证评测数值与历史记录可比
+    os.environ["SAMPLING_AUTOCAST_BF16"] = "0"
     seed_everything(seed)
 
     # --- 1. 初始化阶段 (仅执行一次) ---
@@ -367,7 +453,13 @@ def _evaluation_worker(
         device=eval_device,
     )()
 
-    # 提取 Specs
+    # [修复] 先应用环境 transforms, 再提取 Specs。
+    # CatFrames 等 transform 会改变 observation/state 的维度; 若仍按旧顺序
+    # (先取 spec 后加 transform), 评估模型会按旧维度构造, 与 env 实际输出不匹配。
+    transforms_env = Compose(*task.get_env_transforms(test_env))
+    test_env = TransformedEnv(test_env, transforms_env.clone()).to(eval_device)
+
+    # 提取 Specs (此时已包含 env transforms 造成的维度变化)
     observation_spec = task.observation_spec(test_env)
     action_spec = task.action_spec(test_env)
     info_spec = task.info_spec(test_env)
@@ -400,9 +492,7 @@ def _evaluation_worker(
     else:
         algorithm.device = torch.device("cpu")
 
-    # 环境转换
-    transforms_env = Compose(*task.get_env_transforms(test_env))
-    test_env = TransformedEnv(test_env, transforms_env.clone()).to(eval_device)
+    # RNN hidden state transforms (仅 RNN 模型需要; 不改变 obs/state 维度)
     if model_config.is_rnn:
         test_env = _add_rnn_transforms(lambda: test_env, group_map, model_config)()
     test_env = algorithm.process_env_fun(lambda: test_env)()
@@ -426,13 +516,23 @@ def _evaluation_worker(
     max_steps = task.max_steps(test_env)
 
     # --- 2. 循环监听阶段 ---
-    while not stop_event.is_set():
+    # [修复] 原实现是 `while not stop_event.is_set()`: 主进程 close() 时设置 stop_event,
+    # worker 会立即退出, 队列中"最后一次评估"的权重永远不会被处理
+    # (表现为: 训练结束时最后一次 eval 被终止, 没有 finished 日志/视频/指标)。
+    # 改为: 只有当队列为空且收到停止信号时才退出, 保证 pending 的权重先评估完。
+    while True:
         try:
             # 尝试获取新权重，设置超时以便检查 stop_event
             data = weight_queue.get(timeout=1.0)
-            if data is None:
-                break  # 收到结束信号
+        except queue.Empty:
+            if stop_event.is_set():
+                break
+            continue
 
+        if data is None:
+            break  # 收到结束信号
+
+        try:
             policy_state_dict, total_frames, n_iters_performed = data
 
             # 更新权重
@@ -441,22 +541,52 @@ def _evaluation_worker(
 
             # 运行评估 Rollouts
             evaluation_start = time.time()
+
+            # 视频：流式落盘（裸帧先写临时文件，裁剪后逐帧编码 mp4，峰值内存 ≈ 1 帧）
+            video_raw_path = None
+            video_path = None
+            video_frame_shape = None
+            frame_count = 0
+            raw_file = None
+            if task.has_render(test_env) and experiment_config.render:
+                import imageio
+
+                # 视频目录与训练侧 logger 的 log_dir 保持一致：<folder_name>/<experiment_name>/videos
+                # （torchrl 的 CSVLogger 不是 CSVExperiment 子类，isinstance 探测恒为 False）
+                video_dir = Path(folder_name) / experiment_name / "videos"
+                video_dir.mkdir(parents=True, exist_ok=True)
+                video_path = video_dir / f"eval_video_{n_iters_performed}.mp4"
+                video_raw_path = (
+                    Path(tempfile.gettempdir())
+                    / f"eval_raw_{os.getpid()}_{n_iters_performed}.bin"
+                )
+
             with torch.no_grad():
                 with set_exploration_type(
                     ExplorationType.DETERMINISTIC
                     if experiment_config.evaluation_deterministic_actions
                     else ExplorationType.RANDOM
                 ):
-                    # 渲染回调处理
-                    if task.has_render(test_env) and experiment_config.render:
-                        video_frames = []
+                    # 渲染回调处理（流式：裸帧直接写临时文件，避免整段视频驻留内存）
+                    if video_raw_path is not None:
+                        raw_file = open(video_raw_path, "wb")
 
                         def callback(env, td):
-                            video_frames.append(
-                                task.__class__.render_callback(exp_shell, env, td)
+                            nonlocal frame_count, video_frame_shape
+                            frame = task.__class__.render_callback(exp_shell, env, td)
+                            arr = (
+                                frame.detach().cpu().numpy()
+                                if torch.is_tensor(frame)
+                                else np.asarray(frame)
                             )
+                            if arr.dtype != np.uint8:
+                                arr = np.clip(arr, 0, 255).astype(np.uint8)
+                            arr = np.ascontiguousarray(arr)
+                            video_frame_shape = arr.shape
+                            raw_file.write(arr.tobytes())
+                            frame_count += 1
+                            del frame, arr
                     else:
-                        video_frames = None
                         callback = None
 
                     # 执行 Rollout
@@ -484,6 +614,53 @@ def _evaluation_worker(
                         )
                         rollouts = list(rollouts.unbind(0))
 
+            # 视频编码：关掉临时文件，逐帧读回写入 mp4（裁剪口径同 logger.log_evaluation）
+            if video_raw_path is not None and frame_count > 0:
+                if raw_file is not None:
+                    raw_file.close()
+                    raw_file = None
+                n_keep = frame_count
+                try:
+                    max_length_rollout_0 = 0
+                    for i, r in enumerate(rollouts):
+                        next_done = logger._get_global_done(r).squeeze(-1)
+                        done_index = next_done.nonzero(as_tuple=True)[0]
+                        if done_index.numel() > 0:
+                            r = r[: done_index[0] + 1]
+                        if i == 0:
+                            max_length_rollout_0 = max(
+                                int(r.batch_size[0]), max_length_rollout_0
+                            )
+                    if max_length_rollout_0 > 1:
+                        n_keep = min(n_keep, max_length_rollout_0 - 1)
+                except Exception as e:  # 裁剪失败不影响视频产出
+                    print(f"[Eval Worker] video trim skipped: {e}")
+                frame_bytes = int(np.prod(video_frame_shape))
+                written = 0
+                with open(video_raw_path, "rb") as f, imageio.get_writer(
+                    str(video_path), fps=30, macro_block_size=None
+                ) as writer:
+                    for _ in range(n_keep):
+                        buf = f.read(frame_bytes)
+                        if len(buf) < frame_bytes:
+                            break
+                        writer.append_data(
+                            np.frombuffer(buf, dtype=np.uint8).reshape(video_frame_shape)
+                        )
+                        written += 1
+                video_raw_path.unlink(missing_ok=True)
+                del buf
+                gc.collect()
+                print(
+                    f"[Eval Worker] video written (streaming): {video_path} "
+                    f"({written} frames, per-frame {frame_bytes / 1048576:.2f}MB)"
+                )
+            elif raw_file is not None:
+                raw_file.close()
+                raw_file = None
+            if video_raw_path is not None and video_raw_path.exists():
+                video_raw_path.unlink(missing_ok=True)
+
             # 日志记录
             evaluation_time = time.time() - evaluation_start
             logger.log(
@@ -491,7 +668,7 @@ def _evaluation_worker(
             )
             logger.log_evaluation(
                 rollouts,
-                video_frames=video_frames,
+                video_frames=None,
                 step=n_iters_performed,
                 total_frames=total_frames,
             )
@@ -499,8 +676,15 @@ def _evaluation_worker(
             print(
                 f"[Eval Worker]: Iteration {n_iters_performed} evaluation finished on CPU."
             )
+        except Exception as e:
+            # [诊断修复] 打印评估错误, 避免静默失败
+            import traceback
 
-        except Exception:  # 处理队列为空或超时的正常情况
+            print(
+                f"[Eval Worker] ERROR during evaluation: {type(e).__name__}: {e}",
+                flush=True,
+            )
+            traceback.print_exc()
             continue
 
     test_env.close()
@@ -566,6 +750,10 @@ class Experiment(CallbackNotifier):
         self.total_frames = 0
         self.n_iters_performed = 0
         self.mean_return = 0
+        # [修复] 评测/存档用"累计帧增量"触发（原来的 total_frames % interval 在
+        # 续训起点与新的 frames_per_batch 不对齐时会永远不触发）
+        self._last_eval_frames = 0
+        self._last_checkpoint_frames = 0
 
         self.eval_weight_queue = multiprocessing.Queue(maxsize=1)  # 保证只评估最新的
         self.eval_stop_event = multiprocessing.Event()
@@ -726,6 +914,51 @@ class Experiment(CallbackNotifier):
                 env_func(), transforms_training.clone()
             )
 
+    def _make_optimizer(self, params, group: str = ""):
+        """创建优化器。
+
+        默认 AdamW；设置环境变量 USE_MUON=1 时改用 Muon(矩阵参数)+AdamW(其余)。
+        可用环境变量调参：MUON_LR（默认 0.005）、MUON_MOMENTUM（0.95）、
+        MUON_NS_STEPS（5）、MUON_WEIGHT_DECAY（0.0）、MUON_SCALE_MODE（shape|match_rms|none）。
+        """
+        params = list(params)
+        if os.environ.get("USE_MUON", "0") == "1":
+            from benchmarl.muon import MuonWithAdamW
+
+            muon_lr = float(os.environ.get("MUON_LR", "0.005"))
+            opt = MuonWithAdamW(
+                params,
+                lr=self.config.lr,
+                muon_lr=muon_lr,
+                momentum=float(os.environ.get("MUON_MOMENTUM", "0.95")),
+                ns_steps=int(os.environ.get("MUON_NS_STEPS", "5")),
+                eps=self.config.adam_eps,
+                weight_decay=1e-4,
+                muon_weight_decay=float(os.environ.get("MUON_WEIGHT_DECAY", "0.0")),
+                scale_mode=os.environ.get("MUON_SCALE_MODE", "shape"),
+            )
+            if group not in getattr(self, "_muon_banner_printed", set()):
+                n_muon = sum(
+                    p.numel() for g in opt.param_groups if g.get("use_muon") for p in g["params"]
+                )
+                n_aux = sum(
+                    p.numel() for g in opt.param_groups if not g.get("use_muon") for p in g["params"]
+                )
+                print(
+                    f"[PERF] USE_MUON=1 [{group}] -> Muon(矩阵 {n_muon/1e6:.3f}M 参数, lr={muon_lr}, "
+                    f"mom={opt.param_groups[0]['momentum']}) + AdamW(其余 {n_aux/1e6:.3f}M, "
+                    f"lr={self.config.lr}, eps={self.config.adam_eps}) | scale_mode="
+                    f"{opt.param_groups[0].get('scale_mode', '-')}"
+                )
+                self._muon_banner_printed = getattr(self, "_muon_banner_printed", set()) | {group}
+            return opt
+        return torch.optim.AdamW(
+            params,
+            lr=self.config.lr,
+            eps=self.config.adam_eps,
+            weight_decay=1e-4,
+        )
+
     def _setup_algorithm(self):
         self.algorithm = self.algorithm_config.get_algorithm(experiment=self)
 
@@ -749,12 +982,7 @@ class Experiment(CallbackNotifier):
         }
         self.optimizers = {
             group: {
-                loss_name: torch.optim.AdamW(
-                    params,
-                    lr=self.config.lr,
-                    eps=self.config.adam_eps,
-                    weight_decay=1e-4,
-                )
+                loss_name: self._make_optimizer(params, group)
                 for loss_name, params in self.algorithm.get_parameters(group).items()
             }
             for group in self.group_map.keys()
@@ -769,8 +997,17 @@ class Experiment(CallbackNotifier):
             )
             self.amp_dtype = amp_dtype
 
-            for group in self.group_map.keys():
-                self.grad_scalers[group] = GradScaler()
+            # [修复] 只有 fp16 需要 loss scaling: fp16 指数位少, 梯度易下溢。
+            # bf16 的指数位与 fp32 相同(8 bit), 不存在下溢问题,
+            # GradScaler 的 scale/unscale/inf-check/update 是纯开销
+            # (每 iter 约 600 次调用), 因此 bf16 下不再创建 GradScaler。
+            if amp_dtype == torch.float16:
+                for group in self.group_map.keys():
+                    self.grad_scalers[group] = GradScaler()
+            else:
+                print(
+                    "[AMP] bfloat16 模式: 跳过 GradScaler (bf16 无需 loss scaling)"
+                )
         else:
             self.amp_dtype = torch.float32
 
@@ -1004,6 +1241,33 @@ class Experiment(CallbackNotifier):
         else:
             reset_batch = self.rollout_env.reset()
 
+        # [PERF] 采集/训练重叠：后台线程预取下一批，与 GPU 训练重叠执行
+        _overlap = (
+            os.environ.get("OVERLAP_COLLECTION", "0") == "1"
+            and not self.config.collect_with_grad
+        )
+        if _overlap:
+            self._prefetcher = _CollectionPrefetcher(iterator, self.collector)
+            print(
+                "[PERF] OVERLAP_COLLECTION=1 -> 采集与训练重叠执行（后台预取线程），"
+                "预取批使用上一次同步的权重（1 次迭代滞后）"
+            )
+        else:
+            self._prefetcher = None
+
+        # [DIAG] 纯滞后臂：串行采集，但延迟一轮消费（数据滞后 1 次更新，无任何并发）
+        _delay_consume = (
+            os.environ.get("DELAY_CONSUME", "0") == "1" and not _overlap
+        )
+        _delay_pending = None
+        _force_no_train = os.environ.get("FORCE_SKIP_TRAIN", "0") == "1"
+        if _force_no_train:
+            print("[DIAG] FORCE_SKIP_TRAIN=1 -> 本 run 不执行任何优化器更新（隔离'训练并发'的影响）")
+        if _delay_consume:
+            print(
+                "[DIAG] DELAY_CONSUME=1 -> 串行采集、延迟一轮消费（隔离验证“1 次更新滞后”本身的影响）"
+            )
+
         # Training/collection iterations
         for _ in range(
             self.n_iters_performed, self.config.get_max_n_iters(self.on_policy)
@@ -1011,10 +1275,14 @@ class Experiment(CallbackNotifier):
             iteration_start = time.time()
             torch.cuda.empty_cache()
             if not self.config.collect_with_grad:
-                self.collector.update_policy_weights_()
+                if self._prefetcher is not None:
+                    batch, _prefetch_dt = self._prefetcher.get()
+                else:
+                    self.collector.update_policy_weights_()
             self.policy.eval()
             if not self.config.collect_with_grad:
-                batch = next(iterator)
+                if self._prefetcher is None:
+                    batch = next(iterator)
             else:
                 with set_exploration_type(ExplorationType.RANDOM):
                     batch = self.rollout_env.rollout(
@@ -1036,8 +1304,18 @@ class Experiment(CallbackNotifier):
                     )
 
             # Logging collection
-            collection_time = time.time() - iteration_start
+            if self._prefetcher is not None:
+                collection_time = _prefetch_dt
+            else:
+                collection_time = time.time() - iteration_start
             print(f"collection time: {collection_time}")
+            if (
+                self._prefetcher is not None
+                and os.environ.get("OV_TRIGGER", "before") != "after"
+                and _ < (self.config.get_max_n_iters(self.on_policy) - 1)
+            ):
+                # 本批采集已取回、下一批尚未开始：此刻同步权重并触发下一批后台预取
+                self._prefetcher.trigger_next()
             self.policy.train()
             current_frames = batch.numel()
             self.total_frames += current_frames
@@ -1049,21 +1327,46 @@ class Experiment(CallbackNotifier):
             )
             pbar.set_description(f"mean return = {self.mean_return}", refresh=False)
 
+            # [DIAG] 延迟消费：本轮采集的批次留待下一轮训练；本轮训练上一轮采集的批次
+            _skip_train = _force_no_train
+            if _delay_consume:
+                if _delay_pending is None:
+                    _delay_pending = batch
+                    _skip_train = True
+                    print("[DIAG] first iteration: collect only (no training)")
+                else:
+                    batch, _delay_pending = _delay_pending, batch
+
             # Callback
             self._on_batch_collected(batch)
             batch = batch.detach()
             torch.cuda.empty_cache()
             # Loop over groups
             training_start = time.time()
-            for group in self.train_group_map.keys():
+            # [PROF] 临时分段计时
+            _prof = {}
+            _active_groups = {} if _skip_train else self.train_group_map
+            for group in _active_groups.keys():
+                _prof[group] = {}
+                _t0 = time.perf_counter()
                 group_batch = batch.exclude(*self._get_excluded_keys(group)).to(
                     self.config.train_device
                 )
+                _t1 = time.perf_counter()
                 group_batch = self.algorithm.process_batch(group, group_batch)
+                _t2 = time.perf_counter()
                 if not self.algorithm.has_rnn:
                     group_batch = group_batch.reshape(-1)
                 group_buffer = self.replay_buffers[group]
                 group_buffer.extend(group_batch.to(group_buffer.storage.device))
+                _t3 = time.perf_counter()
+                self._prof_opt = {
+                    "sample": 0.0,
+                    "forward": 0.0,
+                    "bwd_step": 0.0,
+                    "tail": 0.0,
+                    "count": 0,
+                }
                 training_tds = []
                 for _ in range(self.config.n_optimizer_steps(self.on_policy)):
                     for _ in range(
@@ -1073,10 +1376,20 @@ class Experiment(CallbackNotifier):
                         )
                     ):
                         training_tds.append(self._optimizer_loop(group))
+                _t4 = time.perf_counter()
                 training_td = torch.stack(training_tds)
                 self.logger.log_training(
                     group, training_td, step=self.n_iters_performed
                 )
+                _t5 = time.perf_counter()
+                _prof[group] = {
+                    "exclude_to_gpu": _t1 - _t0,
+                    "process_batch": _t2 - _t1,
+                    "extend": _t3 - _t2,
+                    "opt_loops": _t4 - _t3,
+                    "stack_log": _t5 - _t4,
+                    "opt_detail": dict(self._prof_opt),
+                }
                 # Callback
                 self._on_train_end(training_td, group)
                 # Exploration update
@@ -1087,10 +1400,11 @@ class Experiment(CallbackNotifier):
                 if hasattr(explore_layer, "step"):  # Step exploration annealing
                     explore_layer.step(current_frames)
             # Update policy in collector
-            if not self.config.collect_with_grad:
+            if not self.config.collect_with_grad and self._prefetcher is None:
+                # 重叠模式下同步已在 trigger_next() 里做过；此处若再同步会与后台采集竞争
                 self.collector.update_policy_weights_()
             lr_log = {}
-            for group in self.train_group_map.keys():
+            for group in _active_groups.keys():
                 if group in self.lr_schedulers:
                     for loss_name, scheduler in self.lr_schedulers[group].items():
                         if scheduler is not None:
@@ -1101,12 +1415,33 @@ class Experiment(CallbackNotifier):
                 self.logger.log(lr_log, step=self.n_iters_performed)
             # Training timer
             training_time = time.time() - training_start
+            # [PROF] 临时打印分段计时
+            for _g, _d in _prof.items():
+                _od = _d["opt_detail"]
+                print(
+                    f"[PROF][{_g}] exclude_to_gpu={_d['exclude_to_gpu']:.1f}s "
+                    f"process_batch={_d['process_batch']:.1f}s extend={_d['extend']:.1f}s "
+                    f"opt_loops={_d['opt_loops']:.1f}s stack_log={_d['stack_log']:.1f}s || "
+                    f"opt_detail(n={_od['count']}) sample={_od['sample']:.1f}s "
+                    f"forward={_od['forward']:.1f}s bwd_step={_od['bwd_step']:.1f}s "
+                    f"tail={_od['tail']:.1f}s"
+                )
+
+            # [DIAG] OV_TRIGGER=after：把触发挪到训练之后（保留后台采集线程机制，但去掉采集与训练的重叠）
+            if (
+                self._prefetcher is not None
+                and os.environ.get("OV_TRIGGER", "before") == "after"
+                and _ < (self.config.get_max_n_iters(self.on_policy) - 1)
+            ):
+                self._prefetcher.trigger_next()
 
             # Evaluation
             if (
                 self.config.evaluation
                 and (
                     self.total_frames % self.config.evaluation_interval == 0
+                    or self.total_frames - self._last_eval_frames
+                    >= self.config.evaluation_interval
                     or self.n_iters_performed == 0
                 )
                 and (len(self.config.loggers) or self.config.create_json)
@@ -1130,6 +1465,7 @@ class Experiment(CallbackNotifier):
                     self.eval_weight_queue.put_nowait(
                         (policy_state_dict, self.total_frames, self.n_iters_performed)
                     )
+                    self._last_eval_frames = self.total_frames
                     print(
                         f"\n[Main]: Sent weights for iteration {self.n_iters_performed} to Eval Worker."
                     )
@@ -1156,9 +1492,14 @@ class Experiment(CallbackNotifier):
             self.logger.commit()
             if (
                 self.config.checkpoint_interval > 0
-                and self.total_frames % self.config.checkpoint_interval == 0
+                and (
+                    self.total_frames % self.config.checkpoint_interval == 0
+                    or self.total_frames - self._last_checkpoint_frames
+                    >= self.config.checkpoint_interval
+                )
             ):
                 self._save_experiment()
+                self._last_checkpoint_frames = self.total_frames
             pbar.update()
 
         if self.config.checkpoint_at_end:
@@ -1167,12 +1508,24 @@ class Experiment(CallbackNotifier):
 
     def close(self):
         """Close the experiment."""
+        # [PERF] 停止采集预取线程（若启用重叠模式）
+        prefetcher = getattr(self, "_prefetcher", None)
+        if prefetcher is not None:
+            prefetcher.close()
+            self._prefetcher = None
         if self.evaluation_process is not None:
-            print("Terminating background evaluation worker...")
+            print(
+                "Waiting for background evaluation worker to finish pending evaluations..."
+            )
+            # [修复] 不要用 eval_weight_queue.put(None):
+            #   该队列 maxsize=1, 队列满时 put 会阻塞, 而 worker 正在评估 (需 1~3 分钟),
+            #   会造成主进程卡在 close() 里 (表现为"冒烟卡住")。
+            # 只设置 stop_event 即可: worker 的循环会先把队列中 pending 的权重评估完
+            # (get 成功 -> 继续评估), 只有当"队列为空且 stop_event 置位"时才退出。
             self.eval_stop_event.set()
-            self.eval_weight_queue.put(None)  # 发送特殊信号
-            self.evaluation_process.join(timeout=5)
+            self.evaluation_process.join(timeout=180)
             if self.evaluation_process.is_alive():
+                print("Evaluation worker did not finish within 180s, terminating...")
                 self.evaluation_process.terminate()
         if not self.config.collect_with_grad:
             self.collector.shutdown()
@@ -1194,7 +1547,9 @@ class Experiment(CallbackNotifier):
         return excluded_keys
 
     def _optimizer_loop(self, group: str) -> TensorDictBase:
+        _p0 = time.perf_counter()
         subdata = self.replay_buffers[group].sample().to(self.config.train_device)
+        _p1 = time.perf_counter()
 
         # 1. Forward pass (with mixed precision if enabled)
         if self.config.use_amp and self.config.train_device != "cpu":
@@ -1202,6 +1557,7 @@ class Experiment(CallbackNotifier):
                 loss_vals = self.losses[group](subdata)
         else:
             loss_vals = self.losses[group](subdata)
+        _p2 = time.perf_counter()
 
         training_td = loss_vals.detach()
         loss_vals = self.algorithm.process_loss_vals(group, loss_vals)
@@ -1211,34 +1567,85 @@ class Experiment(CallbackNotifier):
             if loss_name in self.optimizers[group].keys():
                 optimizer = self.optimizers[group][loss_name]
 
+                # [稳定化] 非有限 loss：跳过本次更新并清零梯度，防止 NaN 扩散到参数
+                _lv = (
+                    loss_value
+                    if torch.is_tensor(loss_value)
+                    else torch.as_tensor(loss_value)
+                )
+                if not bool(torch.isfinite(_lv).all()):
+                    optimizer.zero_grad(set_to_none=True)
+                    self._nonfinite_loss_skips = (
+                        getattr(self, "_nonfinite_loss_skips", 0) + 1
+                    )
+                    print(
+                        f"[SafeTrain] 非有限 loss ({group}/{loss_name})，跳过本次更新"
+                        f" | 累计 {self._nonfinite_loss_skips} 次"
+                    )
+                    training_td.set(
+                        f"grad_norm_{loss_name}",
+                        torch.tensor(float("nan"), device=_lv.device),
+                    )
+                    continue
+
                 if self.config.use_amp and self.config.train_device != "cpu":
-                    # Mixed precision training flow
-                    scaler = self.grad_scalers[group]
+                    if group in self.grad_scalers:
+                        # fp16 流程: 需要 loss scaling
+                        scaler = self.grad_scalers[group]
 
-                    # Scale loss and backward
-                    scaler.scale(loss_value).backward()
+                        # Scale loss and backward
+                        scaler.scale(loss_value).backward()
 
-                    # Unscale gradients for clipping
-                    scaler.unscale_(optimizer)
+                        # Unscale gradients for clipping
+                        scaler.unscale_(optimizer)
 
-                    # Gradient clipping (on unscaled FP32 gradients)
-                    grad_norm_tensor = self._grad_clip(optimizer)
+                        # Gradient clipping (on unscaled FP32 gradients)
+                        grad_norm_tensor = self._grad_clip(optimizer)
 
-                    # Optimizer step with scaler
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
+                        # Optimizer step with scaler
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+                    else:
+                        # bf16 流程: 无需 loss scaling, 直接反向+步进
+                        loss_value.backward()
+                        grad_norm_tensor = self._grad_clip(optimizer)
+                        # [稳定化] 梯度非有限则跳过参数更新（清零梯度），避免 NaN 写进权重
+                        if bool(torch.isfinite(grad_norm_tensor).all()):
+                            optimizer.step()
+                        else:
+                            optimizer.zero_grad(set_to_none=True)
+                            self._nonfinite_grad_skips = (
+                                getattr(self, "_nonfinite_grad_skips", 0) + 1
+                            )
+                            print(
+                                f"[SafeTrain] 梯度非有限 ({group}/{loss_name})，跳过 optimizer.step()"
+                                f" | 累计 {self._nonfinite_grad_skips} 次"
+                            )
+                        optimizer.zero_grad()
                 else:
                     # Original FP32 training flow
                     loss_value.backward()
                     grad_norm_tensor = self._grad_clip(optimizer)
-                    optimizer.step()
+                    # [稳定化] 梯度非有限则跳过参数更新（清零梯度），避免 NaN 写进权重
+                    if bool(torch.isfinite(grad_norm_tensor).all()):
+                        optimizer.step()
+                    else:
+                        optimizer.zero_grad(set_to_none=True)
+                        self._nonfinite_grad_skips = (
+                            getattr(self, "_nonfinite_grad_skips", 0) + 1
+                        )
+                        print(
+                            f"[SafeTrain] 梯度非有限 ({group}/{loss_name})，跳过 optimizer.step()"
+                            f" | 累计 {self._nonfinite_grad_skips} 次"
+                        )
                     optimizer.zero_grad()
 
                 training_td.set(
                     f"grad_norm_{loss_name}",
                     grad_norm_tensor.detach(),
                 )
+        _p3 = time.perf_counter()
 
         # 3. Update replay buffer priority and target networks
         self.replay_buffers[group].update_tensordict_priority(subdata)
@@ -1248,6 +1655,15 @@ class Experiment(CallbackNotifier):
         callback_loss = self._on_train_step(subdata, group)
         if callback_loss is not None:
             training_td.update(callback_loss)
+        _p4 = time.perf_counter()
+
+        _acc = getattr(self, "_prof_opt", None)
+        if _acc is not None:
+            _acc["sample"] += _p1 - _p0
+            _acc["forward"] += _p2 - _p1
+            _acc["bwd_step"] += _p3 - _p2
+            _acc["tail"] += _p4 - _p3
+            _acc["count"] += 1
 
         return training_td
 
@@ -1383,6 +1799,42 @@ class Experiment(CallbackNotifier):
 
         return state_dict
 
+    def _buffer_state_is_compatible(self, group: str, buffer_state: Dict) -> bool:
+        """检查 checkpoint 内 replay buffer 的存储形状是否与当前配置匹配。
+
+        跨配置恢复（n_envs / frames_per_batch 改变）时行数或时间维不同，
+        直接 load_state_dict 会让后续写入越界（CUDA index out of bounds）。
+        """
+        try:
+            saved = buffer_state["_storage"]["_storage"]["state"]
+            saved_rows = int(saved.shape[0])
+            saved_t = int(saved.shape[1]) if saved.ndim > 1 else None
+        except Exception:
+            return True
+
+        on_policy = self.algorithm.on_policy
+        n_envs = self.config.n_envs_per_worker(on_policy) * self.config.n_workers
+        frames_per_batch = self.config.collected_frames_per_batch(on_policy)
+        if self.algorithm.has_rnn:
+            expected_rows = n_envs
+            expected_t = -(-frames_per_batch // n_envs)
+            ok = (saved_rows == expected_rows) and (
+                saved_t is None or saved_t == expected_t
+            )
+            if not ok:
+                print(
+                    f"[BufferGuard] {group}: ckpt buffer 形状 (rows={saved_rows}, T={saved_t})"
+                    f" != 当前配置 (rows={expected_rows}, T={expected_t})"
+                )
+            return ok
+        if saved_rows != frames_per_batch:
+            print(
+                f"[BufferGuard] {group}: ckpt buffer 行数 {saved_rows}"
+                f" != 当前配置 {frames_per_batch}"
+            )
+            return False
+        return True
+
     def load_state_dict(self, state_dict: Dict) -> None:
         """Load the state_dict for the experiment.
 
@@ -1393,14 +1845,30 @@ class Experiment(CallbackNotifier):
         for group in self.group_map.keys():
             self.losses[group].load_state_dict(state_dict[f"loss_{group}"])
             if state_dict[f"buffer_{group}"] is not None:
-                self.replay_buffers[group].load_state_dict(
-                    state_dict[f"buffer_{group}"]
-                )
+                # [修复] 跨配置恢复 buffer 会导致存储形状不匹配：
+                # 例如 ckpt 存于 1500 envs/225k frames，当前配置 2000 envs/300k frames，
+                # 恢复后 storage 只有 1500 行，写入 2000 行时触发
+                # CUDA "index out of bounds" (IndexKernel.cu) 崩溃。
+                # on-policy buffer 内容每轮都会被重写，可直接跳过。
+                if self._buffer_state_is_compatible(
+                    group, state_dict[f"buffer_{group}"]
+                ):
+                    self.replay_buffers[group].load_state_dict(
+                        state_dict[f"buffer_{group}"]
+                    )
+                else:
+                    print(
+                        f"[BufferGuard] 跳过 {group} 的 replay buffer 恢复："
+                        f"checkpoint 内存储形状与当前配置不一致"
+                        f"（on-policy 缓冲内容可丢弃，不影响训练）。"
+                    )
 
             # Load GradScaler state for mixed precision training
+            # [修复] bf16 模式下 grad_scalers 为空 dict, 直接索引会 KeyError
+            # (旧 checkpoint 里可能仍带有 grad_scaler_* 状态)
             if self.config.use_amp and self.config.train_device != "cpu":
                 scaler_key = f"grad_scaler_{group}"
-                if scaler_key in state_dict:
+                if scaler_key in state_dict and group in self.grad_scalers:
                     self.grad_scalers[group].load_state_dict(state_dict[scaler_key])
 
             # Load optimizer state
@@ -1422,11 +1890,23 @@ class Experiment(CallbackNotifier):
                             self.lr_schedulers[group][name].load_state_dict(sched_state)
 
         if not self.config.collect_with_grad:
-            self.collector.load_state_dict(state_dict["collector"])
+            try:
+                self.collector.load_state_dict(state_dict["collector"])
+            except RuntimeError as e:
+                # [修复] n_envs 变化后 CatFrames 历史缓冲形状不匹配（[1000,2,410] -> [1500,2,410]）
+                # 收集器状态（历史缓冲/RNG）非必要，丢弃并用全新状态继续训练
+                warnings.warn(
+                    "collector state_dict 恢复失败（通常是 n_envs 变了），"
+                    f"改用全新收集器状态继续训练: {e}"
+                )
         self.total_time = state_dict["state"]["total_time"]
         self.total_frames = state_dict["state"]["total_frames"]
         self.n_iters_performed = state_dict["state"]["n_iters_performed"]
         self.mean_return = state_dict["state"]["mean_return"]
+        # [修复] 续训时的增量触发基准：存档从恢复点起每 checkpoint_interval 帧一次；
+        # 评测从恢复点起立刻做一次（便于确认评测链路正常），之后每 evaluation_interval 帧一次
+        self._last_checkpoint_frames = self.total_frames
+        self._last_eval_frames = self.total_frames - self.config.evaluation_interval
 
     def _save_experiment(self) -> None:
         """Checkpoint trainer"""

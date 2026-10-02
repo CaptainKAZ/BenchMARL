@@ -55,6 +55,7 @@ class Attention(Model):
         roles: Dict[str, List[str]],
         definitions: Dict[str, Dict[str, int]],
         use_ego_embedding: bool,
+        ego_pool: str = "none",
         encoder_groups: Dict[str, Dict[str, List[str]]] = None,
         ignore_features: List[str] = None,
         share_params_override: Optional[bool] = None,
@@ -67,6 +68,8 @@ class Attention(Model):
         self.roles = roles
         self.definitions = definitions
         self.use_ego_embedding = use_ego_embedding
+        # "none" = 只取 ego token（旧行为）；"mean" = ego ⊕ 其余 token 均值（下游带宽翻倍）
+        self.ego_pool = ego_pool
         self.ignore_features = set(ignore_features) if ignore_features else set()
         self.encoder_groups_config = encoder_groups or {}
         compile_attention_blocks = kwargs.pop('compile_attention_blocks', False)
@@ -107,6 +110,12 @@ class Attention(Model):
                 for _ in range(num_attention_layers)
             ])
 
+        import os as _os
+        _attn_env_mode = _os.environ.get("ATTENTION_COMPILE_MODE", None)
+        if _attn_env_mode == "off":
+            compile_attention_blocks = False
+        elif _attn_env_mode:
+            compile_mode = _attn_env_mode
         if compile_attention_blocks:
             if not self.share_params:
                 # 编译每个 agent 的每一层
@@ -178,7 +187,10 @@ class Attention(Model):
 
         # 5. 输出特征维度（聚合后）
         if self.use_ego_embedding:
-            self._aggregated_dim = self.embedding_dim
+            # ego_pool 非 none 时额外拼接池化向量（带宽翻倍）
+            self._aggregated_dim = self.embedding_dim * (
+                2 if self.ego_pool in ("mean", "mean_all") else 1
+            )
         else:
             self._aggregated_dim = self._num_entities * self.embedding_dim
 
@@ -237,7 +249,9 @@ class Attention(Model):
 
         # 计算 MLP 输入维度
         if self.use_ego_embedding:
-            mlp_in = self.embedding_dim + global_dim
+            mlp_in = self.embedding_dim * (
+                2 if self.ego_pool in ("mean", "mean_all") else 1
+            ) + global_dim
         else:
             mlp_in = (num_entities * self.embedding_dim) + global_dim
 
@@ -282,7 +296,14 @@ class Attention(Model):
 
         # 1. 拼接输入（排除 RNN 相关键）
         in_keys = [k for k in self.in_keys if k not in getattr(self, "rnn_keys", [])]
-        input_tensor = torch.cat([tensordict.get(key) for key in in_keys], dim=-1)
+        # [fp16 观测] 先转 fp32 再拼接：环境可能输出半精度观测（省内存）。
+        # 必须在 cat 之前转换 —— CPU autocast 下对 fp16 张量做 cat 会崩：
+        #   RuntimeError: Unexpected floating ScalarType in at::autocast::prioritize
+        input_list = []
+        for key in in_keys:
+            t = tensordict.get(key)
+            input_list.append(t if t.dtype == torch.float32 else t.float())
+        input_tensor = torch.cat(input_list, dim=-1)
 
         debug_print(self.name, "Input tensor", input_tensor,
                    f"share_params={self.share_params}, input_has_agent_dim={self.input_has_agent_dim}, "
@@ -350,6 +371,28 @@ class Attention(Model):
         tensordict.set(self.out_key, output)
         return tensordict
 
+    def _aggregate(self, sequence: torch.Tensor) -> torch.Tensor:
+        """特征聚合。
+
+        - use_ego_embedding=False: 展平全部 token；
+        - ego_pool="none": 只取 self token（旧行为，128 维瓶颈）；
+        - ego_pool="mean": self token ⊕ 其余 token 均值（如 128→256 维），
+          把「点位/篮筐相对位置、队友与两名防守者的显式表示」带进下游；
+        - ego_pool="mean_all": self token ⊕ 全部 token（含 self）均值，
+          池化覆盖整组实体，self 在均值中占 1/num_entities；
+          注意力主体参数不变，只加宽末端 MLP 与 GRU 的输入。
+        """
+        if not self.use_ego_embedding:
+            return sequence.flatten(-2, -1)
+        ego = sequence[..., 0, :]
+        if self.ego_pool == "mean_all":
+            pooled = sequence.mean(dim=-2)
+            return torch.cat([ego, pooled], dim=-1)
+        if self.ego_pool == "mean" and sequence.shape[-2] > 1:
+            others = sequence[..., 1:, :].mean(dim=-2)
+            return torch.cat([ego, others], dim=-1)
+        return ego
+
     def _forward_shared(self, input_tensor: torch.Tensor) -> torch.Tensor:
         """共享参数模式：所有 agent 使用相同的编码器和注意力层"""
         debug_print(self.name, "[_forward_shared] Input tensor", input_tensor)
@@ -398,10 +441,7 @@ class Attention(Model):
         sequence = flat_sequence.view(pre_attn_shape)
 
         # 4. 特征聚合
-        if self.use_ego_embedding:
-            features = sequence[..., 0, :]
-        else:
-            features = sequence.flatten(-2, -1)
+        features = self._aggregate(sequence)
 
         debug_print(self.name, "[_forward_shared] Features output", features)
         return features
@@ -448,10 +488,7 @@ class Attention(Model):
                 sequence = flat_sequence.view(pre_attn_shape)
 
                 # 特征聚合
-                if self.use_ego_embedding:
-                    agent_features = sequence[..., 0, :]
-                else:
-                    agent_features = sequence.flatten(-2, -1)
+                agent_features = self._aggregate(sequence)
 
                 agent_outputs.append(agent_features)
 
@@ -496,10 +533,7 @@ class Attention(Model):
             sequence = flat_sequence.view(pre_attn_shape)
 
             # 特征聚合
-            if self.use_ego_embedding:
-                single_output = sequence[..., 0, :]
-            else:
-                single_output = sequence.flatten(-2, -1)
+            single_output = self._aggregate(sequence)
 
             # 为每个 agent 复制输出（expand agent 维度）
             features = single_output.unsqueeze(-2).expand(
@@ -560,10 +594,7 @@ class Attention(Model):
                 sequence = sequence.squeeze(0)
 
             # 4. 特征聚合
-            if self.use_ego_embedding:
-                agent_features = sequence[..., 0, :]  # 只取第一个 token（ego）
-            else:
-                agent_features = sequence.flatten(-2, -1)  # 展平最后两维（seq_len, embed）
+            agent_features = self._aggregate(sequence)
 
             agent_outputs.append(agent_features)
 
@@ -581,6 +612,7 @@ class AttentionConfig(ModelConfig):
     final_mlp_hidden_layers: List[int] = field(default_factory=lambda: [64, 64])
     dropout_prob: float = 0.0
     use_ego_embedding: bool = False
+    ego_pool: str = "none"
     input_feature_order: List[str] = field(default_factory=list)
     roles: Dict[str, List[str]] = field(default_factory=dict)
     definitions: Dict[str, Dict[str, int]] = field(default_factory=dict)

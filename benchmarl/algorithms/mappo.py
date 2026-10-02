@@ -5,7 +5,7 @@
 #
 
 from dataclasses import dataclass, MISSING
-from typing import Dict, Iterable, Tuple, Type
+from typing import Dict, Iterable, List, Optional, Tuple, Type
 
 import torch
 from tensordict import TensorDictBase
@@ -179,6 +179,12 @@ class Mappo(Algorithm):
         use_tanh_normal: bool,
         minibatch_advantage: bool,
         share_param_actor: bool,
+        normalize_advantage: bool = False,
+        normalize_advantage_exclude_dims: Optional[List[int]] = None,
+        bounded_tanh_params: bool = True,
+        loc_bound: float = 3.0,
+        scale_min: float = 0.01,
+        scale_max: float = 1.0,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -193,6 +199,13 @@ class Mappo(Algorithm):
         self.use_tanh_normal = use_tanh_normal
         self.minibatch_advantage = minibatch_advantage
         self.share_param_actor = share_param_actor
+        self.normalize_advantage = normalize_advantage
+        self.normalize_advantage_exclude_dims = normalize_advantage_exclude_dims
+        # [稳定化] 有界策略头参数（见 BoundedNormalParamExtractor）
+        self.bounded_tanh_params = bounded_tanh_params
+        self.loc_bound = loc_bound
+        self.scale_min = scale_min
+        self.scale_max = scale_max
 
     #############################
     # Overridden abstract methods
@@ -206,11 +219,24 @@ class Mappo(Algorithm):
             actor=policy_for_loss,
             critic=self.get_critic(group),
             clip_epsilon=self.clip_epsilon,
-            entropy_coeff=self.entropy_coef,
-            critic_coeff=self.critic_coef,
+            # [修复] 参数名曾误写成 entropy_coeff/critic_coeff（双 f）。torchrl 0.8.x 的
+            # ClipPPOLoss 只有 entropy_coef/critic_coef（单 f）+ 末尾 **kwargs，而
+            # PPOLoss.__init__ 调 super().__init__() 时不转发 kwargs -> 未知关键字被静默
+            # 丢弃，系数恒为默认值 (entropy_coef=0.01, critic_coef=1.0)，yaml 里的数值
+            # 形同虚设。此处改为单 f 后，yaml 中的值才真正生效。
+            entropy_coef=self.entropy_coef,
+            critic_coef=self.critic_coef,
             loss_critic_type=self.loss_critic_type,
-            normalize_advantage=False,
-            # normalize_advantage_exclude_dims=[-2]
+            # [稳定化] 默认对 advantage 做标准化。
+            # advantage 量级实测 std 14~35, |adv|>10 占比 23%~64%, 与 grad clip=2.0 严重不匹配。
+            # 多智能体场景必须传 exclude_dims, 否则会跨 agent 混合统计 (torchrl 官方建议),
+            # [-2] 表示 agent 维保持独立 -> 每个 agent 各自标准化, 避免 A1 的弱信号被 A2 淹没。
+            normalize_advantage=self.normalize_advantage,
+            normalize_advantage_exclude_dims=(
+                tuple(self.normalize_advantage_exclude_dims)
+                if self.normalize_advantage_exclude_dims
+                else ()
+            ),
         )
         loss_module.set_keys(
             reward=(group, "reward"),
@@ -361,7 +387,7 @@ class Mappo(Algorithm):
 
             if isinstance(sub_spec, (BoundedTensorSpec, UnboundedContinuousTensorSpec)):
                 dim = sub_spec.shape[-1] * 2 
-                distribution_map[name] = IndependentNormal if not self.use_tanh_normal else TanhNormal
+                distribution_map[name] = IndependentNormal if not self.use_tanh_normal else SafeTanhNormal
             else:
                 dim = sub_spec.space.n
                 distribution_map[name] = Categorical if self.action_mask_spec is None else MaskedCategorical
@@ -399,7 +425,15 @@ class Mappo(Algorithm):
                 loc_key = (group, "params", name, "loc")
                 scale_key = (group, "params", name, "scale")
                 modules.append(TensorDictModule(
-                    NormalParamExtractor(scale_mapping=self.scale_mapping),
+                    (
+                        BoundedNormalParamExtractor(
+                            loc_bound=self.loc_bound,
+                            scale_min=self.scale_min,
+                            scale_max=self.scale_max,
+                        )
+                        if (self.use_tanh_normal and self.bounded_tanh_params)
+                        else NormalParamExtractor(scale_mapping=self.scale_mapping)
+                    ),
                     in_keys=[raw_key],
                     out_keys=[loc_key, scale_key]
                 ))
@@ -483,8 +517,19 @@ class Mappo(Algorithm):
         )
 
         if continuous:
+            if self.use_tanh_normal and self.bounded_tanh_params:
+                # [稳定化] 有界策略头：loc∈(−3,3)、scale∈(0.01,1.0)，避免 tanh 饱和把 log_prob 推向 1e6 量级
+                _extractor = BoundedNormalParamExtractor(
+                    loc_bound=self.loc_bound,
+                    scale_min=self.scale_min,
+                    scale_max=self.scale_max,
+                )
+            else:
+                _extractor = NormalParamExtractor(
+                    scale_mapping=self.scale_mapping, scale_lb=1e-4
+                )
             extractor_module = TensorDictModule(
-                NormalParamExtractor(scale_mapping=self.scale_mapping, scale_lb=1e-4),
+                _extractor,
                 in_keys=[(group, "logits")],
                 out_keys=[(group, "loc"), (group, "scale")],
             )
@@ -494,7 +539,7 @@ class Mappo(Algorithm):
                 in_keys=[(group, "loc"), (group, "scale")],
                 out_keys=[(group, "action")],
                 distribution_class=(
-                    IndependentNormal if not self.use_tanh_normal else TanhNormal
+                    IndependentNormal if not self.use_tanh_normal else SafeTanhNormal
                 ),
                 distribution_kwargs=(
                     {
@@ -579,20 +624,33 @@ class Mappo(Algorithm):
             increment = batch.batch_size[0] + 1
         last_start_index = 0
         start_index = increment
-        minibatches = []
+        adv_key = loss.tensor_keys.advantage
+        vt_key = loss.tensor_keys.value_target
+        adv_parts, vt_parts = [], []
         while last_start_index < batch.shape[0]:
             minimbatch = batch[last_start_index:start_index]
-            minibatches.append(minimbatch)
             with torch.no_grad():
                 loss.value_estimator(
                     minimbatch,
                     params=loss.critic_network_params,
                     target_params=loss.target_critic_network_params,
                 )
+            # [内存优化] TensorDict 切片是副本, 只 clone 出体积很小的
+            # advantage/value_target, 让切片在本轮结束后即可被释放,
+            # 避免在内存中同时保留整批切片副本 (约 1 个完整 batch 的量级)。
+            if adv_key is not None and adv_key in minimbatch.keys(True):
+                adv_parts.append(minimbatch.get(adv_key).clone())
+            if vt_key is not None and vt_key in minimbatch.keys(True):
+                vt_parts.append(minimbatch.get(vt_key).clone())
+            del minimbatch
+
             last_start_index = start_index
             start_index += increment
 
-        batch = torch.cat(minibatches, dim=0)
+        if adv_parts:
+            batch.set(adv_key, torch.cat(adv_parts, dim=0))
+        if vt_parts:
+            batch.set(vt_key, torch.cat(vt_parts, dim=0))
         return batch
 
     def process_loss_vals(
@@ -654,8 +712,64 @@ class Mappo(Algorithm):
                 out_keys=[(group, "state_value")],
             )
             value_module = TensorDictSequential(value_module, expand_module)
-        value_module = torch.compile(value_module)
+        # [性能] critic 的 torch.compile 用环境变量控制，便于 A/B：
+        #   CRITIC_COMPILE_MODE = off | default | reduce-overhead | max-autotune-no-cudagraphs
+        # 实测（3 轮冒烟，/tmp/opencode 日志）：off 的 opt_loops 更小更稳（attacker 28.7-29.1s，
+        # 编译时 28.9-35.4s 抖动很大），故默认关闭；需要时用环境变量打开。
+        import os as _os
+        critic_compile_mode = _os.environ.get("CRITIC_COMPILE_MODE", "off")
+        if critic_compile_mode != "off":
+            value_module = torch.compile(value_module, mode=critic_compile_mode)
         return value_module
+
+
+# ---------------------------------------------------------------------------
+# [稳定化] 有界参数头 + 安全 TanhNormal
+#   v27 崩溃回溯：策略头输出 loc 漂移到 ±30、scale 到 90，动作长期贴在 tanh 边界，
+#   训练侧反解 log_prob 在饱和点得到 ~1e6 量级的值 → importance ratio 变 0/∞ → 0×∞ → NaN。
+#   下面两个类分别从"分布参数范围"和"log_prob 数值"两侧封死这条路径。
+# ---------------------------------------------------------------------------
+
+
+class BoundedNormalParamExtractor(torch.nn.Module):
+    """把网络输出 (..., 2D) 映射为有界的 loc / scale。
+
+    - loc   = loc_bound * tanh(raw_loc / loc_bound)                     ∈ (−loc_bound, loc_bound)
+    - scale = scale_min + (scale_max − scale_min) * sigmoid(raw_scale)  ∈ (scale_min, scale_max)
+
+    采样是 upscale·tanh(z)：只要 |loc| 有界、scale 有下限，动作就贴不到 ±upscale 的饱和点，
+    log_prob 也始终有限（scale 有下限、loc 有界 ⇒ 上界可控）。
+    """
+
+    def __init__(
+        self,
+        loc_bound: float = 3.0,
+        scale_min: float = 0.01,
+        scale_max: float = 1.0,
+    ):
+        super().__init__()
+        self.loc_bound = float(loc_bound)
+        self.scale_min = float(scale_min)
+        self.scale_max = float(scale_max)
+
+    def forward(self, logits: torch.Tensor):
+        loc_raw, scale_raw = logits.chunk(2, dim=-1)
+        loc = self.loc_bound * torch.tanh(loc_raw / self.loc_bound)
+        scale = self.scale_min + (self.scale_max - self.scale_min) * torch.sigmoid(
+            scale_raw
+        )
+        return loc, scale
+
+
+class SafeTanhNormal(TanhNormal):
+    """log_prob 前把动作夹进开区间 (low, high)，避免 atanh 在饱和点反解出 ±inf/巨大值。"""
+
+    def log_prob(self, value):
+        low = torch.as_tensor(self.low, device=value.device, dtype=value.dtype)
+        high = torch.as_tensor(self.high, device=value.device, dtype=value.dtype)
+        margin = (high - low) * 1e-3
+        value = value.clamp(min=low + margin, max=high - margin)
+        return super().log_prob(value)
 
 
 @dataclass
@@ -672,6 +786,14 @@ class MappoConfig(AlgorithmConfig):
     use_tanh_normal: bool = MISSING
     minibatch_advantage: bool = MISSING
     share_param_actor: bool = MISSING
+    # [稳定化] advantage 标准化开关; exclude_dims 指定保持独立统计的维度 ([-2] = agent 维)
+    normalize_advantage: bool = MISSING
+    normalize_advantage_exclude_dims: Optional[List[int]] = None
+    # [稳定化] 有界策略头 (仅 use_tanh_normal 时生效): loc 用 tanh 限幅、scale 用 sigmoid 限幅
+    bounded_tanh_params: bool = True
+    loc_bound: float = 3.0
+    scale_min: float = 0.01
+    scale_max: float = 1.0
 
     @staticmethod
     def associated_class() -> Type[Algorithm]:

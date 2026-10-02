@@ -1,11 +1,11 @@
 
 name: gru
 
-hidden_size: 128
+hidden_size: 256
 n_layers: 1
 bias: True
 dropout: 0
-compile: True
+compile: False   # 实测 torch.compile(mode="reduce-overhead") 反而更慢（actor fwd+bwd 186.5ms → 104.7ms，见 /tmp/opencode/bench3_opt.py）
 use_input_passthrough: True
 mlp_num_cells: [256,256]
 mlp_layer_class: torch.nn.Linear

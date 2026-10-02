@@ -4,12 +4,14 @@
 #  LICENSE file in the root directory of this source tree.
 #
 
+import os
 import pathlib
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
+import torch
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModuleBase, TensorDictSequential
 from tensordict.utils import NestedKey
@@ -45,6 +47,17 @@ def output_has_agent_dim(share_params: bool, centralised: bool) -> bool:
         return False
     else:
         return True
+
+
+def cpu_bf16_sampling_enabled() -> bool:
+    """CPU 采样时是否对模型前向使用 bf16 autocast（环境变量 ``SAMPLING_AUTOCAST_BF16=1`` 开启）。
+
+    背景：本项目 CPU 采样比 CUDA 采样快（n_envs=1500 时 ~111 vs ~195 ms/1k 样本），
+    而在支持 avx512_bf16 的 CPU（本机 Ryzen 7 9800X3D）上 bf16 矩阵乘比 fp32 快约 5×，
+    整个策略前向约 1.35×。开启后模型内部以 bf16 计算，输出统一转回 fp32。
+    注意：该开关面向“采集/推理”，不要在 CPU 上做训练时开启（GPU 训练不受影响）。
+    """
+    return os.environ.get("SAMPLING_AUTOCAST_BF16", "0") == "1"
 
 
 class Model(TensorDictModuleBase, ABC):
@@ -160,6 +173,25 @@ class Model(TensorDictModuleBase, ABC):
 
     def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
         # _check_spec(tensordict, self.input_spec)
+        # CPU bf16 采样加速（SAMPLING_AUTOCAST_BF16=1）：仅在“张量在 CPU 且尚未处于
+        # cpu autocast 中”时生效；输出强制转回 fp32，避免 bf16 泄漏给分布采样/环境/缓冲区。
+        if cpu_bf16_sampling_enabled() and not torch.is_autocast_enabled("cpu"):
+            try:
+                is_cpu = tensordict.device.type == "cpu"
+            except Exception:
+                is_cpu = False
+            if is_cpu:
+                with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                    tensordict = self._forward(tensordict)
+                for key in self.out_keys:
+                    value = tensordict.get(key, None)
+                    if (
+                        isinstance(value, torch.Tensor)
+                        and value.is_floating_point()
+                        and value.dtype != torch.float32
+                    ):
+                        tensordict.set(key, value.float())
+                return tensordict
         tensordict = self._forward(tensordict)
         # _check_spec(tensordict, self.output_spec)
         return tensordict

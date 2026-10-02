@@ -3,3 +3,11 @@ defaults:
   - _self_
 
 max_steps: 150
+
+# --- 固定初始位置 + Attention+GRU (网络自带记忆，不再堆叠历史帧) ---
+fixed_init: true
+fixed_spot: false
+# history_frames <= 0 时不添加 CatFrames transform:
+# 单帧观测 41 维、全局 state 23 维, 记忆交给 GRU (整段 150 步 BPTT)
+history_frames: 0
+history_stride: 2

@@ -25,6 +25,9 @@ final_mlp_hidden_layers: [256]
 # 这意味着 Transformer 输出后，只取 Sequence 中的第一个 Token (Ego) 做决策
 use_ego_embedding: True
 
+# 【v28】ego 聚合带宽：self token ⊕ 其余 token 均值（128 → 256），缓解末端瓶颈
+ego_pool: mean
+
 # ------------------------------------------------------------------------------
 # 2. 编码器分组策略 (Encoder Grouping Strategy) - 【核心改动】
 # ------------------------------------------------------------------------------
@@ -36,7 +39,8 @@ encoder_groups:
   players:
     features:
       - teammate_embed
-      - opponent_embed
+      - opponent1_embed
+      - opponent2_embed
 
 # ------------------------------------------------------------------------------
 # 3. 忽略列表 (Ignore Features)
@@ -52,12 +56,13 @@ ignore_features:
 # 4.1. 特征顺序
 # 【非常重要】如果 use_ego_embedding: True，请务必保证 'self_embed' 排在第一个！
 # 这样它才会对应 Sequence Index 0。
-# 新观测结构 (39维): 每个非自己agent 8维 (相对位置+相对速度+绝对位置+绝对速度)
+# 新观测结构 (41维): self 9维, 每个非自己agent 8维 (相对位置+相对速度+绝对位置+绝对速度)
 # spot和basket各4维 (相对位置+绝对位置)
 input_feature_order:
-  - self_embed        # -> Index 0 (7维, Ego Token)
+  - self_embed        # -> Index 0 (9维, Ego Token)
   - teammate_embed    # -> Index 1 (8维)
-  - opponent_embed    # -> Index 2, 3 (8维, 共2个)
+  - opponent1_embed   # -> Index 2 (8维, D1)
+  - opponent2_embed   # -> Index 3 (8维, D2)
   - spot_embed        # -> Index 4 (4维)
   - basket_embed      # -> Index 5 (4维)
 
@@ -67,7 +72,8 @@ roles:
   entity:
     - self_embed
     - teammate_embed
-    - opponent_embed
+    - opponent1_embed
+    - opponent2_embed
     - spot_embed
     - basket_embed
 
@@ -77,9 +83,10 @@ roles:
 
 # 4.3. 维度定义 (必须与环境 Observation 一致)
 definitions:
-  self_embed:     { dim: 7, num: 1 }
-  teammate_embed: { dim: 8, num: 1 }
-  opponent_embed: { dim: 8, num: 2 }
+  self_embed:      { dim: 9, num: 1 }   # pos(2)+vel(2)+上帧动作(2)+in_spot(1)+读条进度(1)+剩余时间(1)
+  teammate_embed:  { dim: 8, num: 1 }
+  opponent1_embed: { dim: 8, num: 1 }   # D1
+  opponent2_embed: { dim: 8, num: 1 }   # D2
 
-  spot_embed:     { dim: 4, num: 1 }
-  basket_embed:   { dim: 4, num: 1 }
+  spot_embed:      { dim: 4, num: 1 }
+  basket_embed:    { dim: 4, num: 1 }

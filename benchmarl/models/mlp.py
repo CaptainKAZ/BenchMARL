@@ -118,6 +118,9 @@ class Mlp(Model):
     def _forward(self, tensordict: TensorDictBase) -> TensorDictBase:
         # Gather in_key
         input = torch.cat([tensordict.get(in_key) for in_key in self.in_keys], dim=-1)
+        # [fp16 观测] 环境为省内存输出 fp16 观测, 模型权重是 fp32, 此处统一转换
+        if input.dtype != torch.float32:
+            input = input.float()
 
         # Has multi-agent input dimension
         if self.input_has_agent_dim:

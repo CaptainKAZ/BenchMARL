@@ -24,6 +24,24 @@ from benchmarl.models.debug_utils import debug_print, debug_separator
 
 
 class GRU(torch.nn.Module):
+    """多层 GRU。
+
+    [性能改造] 旧实现用 torchrl 的 GRUCell 在 Python 里逐时间步循环（T=150 ⇒ 每步都要发一次
+    kernel），训练时吃掉 actor 前向的一大块时间，而且 vmap 下无法走 cuDNN 融合核。
+    新实现用 ``nn.GRU``（cuDNN 融合实现），把"逐时间步"改成"整段一次调用"：
+    按 ``is_init`` 把每个 batch 行切成若干片段（run），所有片段拼成一个大 batch 一次算完，
+    再 gather 回原时间轴。数值上与旧实现完全等价（T=1 采集路径/中途重置/非零 h_0/多层
+    共 6 组用例逐位一致，见 /tmp/opencode/probe_fused_gru.py）。
+
+    形状约定：
+        input:   (B, T, F)
+        is_init: (B, T, 1)，True 表示该时刻开启新片段（隐状态清零）
+        h:       (B, L, H)，片段起点处的隐状态（训练时通常全 0）
+    返回：
+        output:  (B, T, H)（最后一层输出）
+        h_n:     (B, L, H)（每行最后一个片段的终态）
+    """
+
     def __init__(
         self,
         input_size: int,
@@ -45,11 +63,13 @@ class GRU(torch.nn.Module):
 
         self.grus = torch.nn.ModuleList(
             [
-                GRUCell(
+                torch.nn.GRU(
                     input_size if i == 0 else hidden_size,
                     hidden_size,
-                    device=self.device,
+                    num_layers=1,
                     bias=self.bias,
+                    batch_first=True,
+                    device=self.device,
                 )
                 for i in range(self.n_layers)
             ]
@@ -61,25 +81,64 @@ class GRU(torch.nn.Module):
         is_init,
         h,
     ):
-        hs = []
-        h = list(h.unbind(dim=-2))
-        for in_t, init_t in zip(
-            input.unbind(self.time_dim), is_init.unbind(self.time_dim)
-        ):
-            for layer in range(self.n_layers):
-                h[layer] = torch.where(init_t, 0, h[layer])
+        B, T, F_ = input.shape
+        dev = input.device
+        init = is_init[..., 0].reshape(B, T)
 
-                h[layer] = self.grus[layer](in_t, h[layer])
+        # ---- 1) 向量化切分：行内新段起点 = 行首 or 任意 reset 帧 ----
+        t_grid = torch.arange(T, device=dev).expand(B, T)
+        new_seg = init.clone()
+        new_seg[:, 0] = True
+        seg_in_row = new_seg.long().cumsum(1) - 1  # (B,T) 段在本行内的序号(0起)
+        seg_start = torch.cummax(
+            torch.where(new_seg, t_grid, torch.zeros_like(t_grid)), 1
+        ).values  # 每个位置所属段的起始时刻
+        pos_in_seg = t_grid - seg_start  # (B,T) 段内偏移
+        n_seg = seg_in_row[:, -1] + 1  # (B,)
+        seg_base = torch.cumsum(n_seg, 0) - n_seg  # (B,) 每行第一段的全局段号
+        seg_id = (seg_base.unsqueeze(-1) + seg_in_row).reshape(B * T)
+        R = int(n_seg.sum().item())
+        max_len = int(pos_in_seg.max().item()) + 1
 
-                if layer < self.n_layers - 1 and self.dropout:
-                    in_t = F.dropout(h[layer], p=self.dropout, training=self.training)
-                else:
-                    in_t = h[layer]
+        # 目标位置：每个 (b,t) -> 展平后的 (段, 段内偏移)
+        dest = seg_id * max_len + pos_in_seg.reshape(-1)
+        input_2d = input.reshape(B * T, F_)
+        x_flat = input_2d.new_zeros(R * max_len, F_)
+        x_flat.index_copy_(0, dest, input_2d)
+        x = x_flat.view(R, max_len, F_)
 
-            hs.append(in_t)
-        h_n = torch.stack(h, dim=-2)
-        output = torch.stack(hs, self.time_dim)
+        # 每行最后一段的终态位置（用于 h_n）
+        last_in_seg = torch.ones_like(new_seg)
+        last_in_seg[:, :-1] = seg_in_row[:, :-1] != seg_in_row[:, 1:]
+        last_row = (last_in_seg & (t_grid == T - 1)).reshape(-1)
 
+        output = None
+        h_n_list = []
+        for layer in range(self.n_layers):
+            # 段初始隐状态：只给各行的第一段（行首若是 reset 则取 0），其余从 0 开始
+            h_init = h[:, layer, :]
+            h_init = torch.where(
+                init[:, 0].unsqueeze(-1), torch.zeros_like(h_init), h_init
+            )
+            h_init_runs = torch.zeros(
+                R, self.hidden_size, device=dev, dtype=h_init.dtype
+            )
+            h_init_runs[seg_base] = h_init
+
+            y = self.grus[layer](x, h_init_runs.unsqueeze(0))[0]  # (R, max_len, H)
+
+            y_flat = y.reshape(R * max_len, self.hidden_size)
+            output = y_flat[dest].view(B, T, self.hidden_size)
+            h_n_list.append(y_flat[dest[last_row]].unsqueeze(1))
+
+            if layer < self.n_layers - 1:
+                x = (
+                    F.dropout(y, p=self.dropout, training=self.training)
+                    if self.dropout
+                    else y
+                )
+
+        h_n = torch.cat(h_n_list, dim=1)
         return output, h_n
 
 
@@ -141,7 +200,7 @@ class MultiAgentGRU(torch.nn.Module):
         self._make_params(agent_networks)
 
         with torch.device("meta"):
-            self._empty_gru = get_net(
+            empty_gru = get_net(
                 input_size=input_size,
                 hidden_size=self.hidden_size,
                 n_layers=self.n_layers,
@@ -151,9 +210,13 @@ class MultiAgentGRU(torch.nn.Module):
                 compile=self.compile,
             )
             # Remove all parameters
-            TensorDict.from_module(self._empty_gru).data.to("meta").to_module(
-                self._empty_gru
-            )
+            TensorDict.from_module(empty_gru).data.to("meta").to_module(empty_gru)
+        # [关键] 把 meta 模块移出 nn.Module 的注册表：否则它的 meta 参数会被
+        # named_parameters()/state_dict()/collector 的权重搬运看到，而 meta tensor
+        # 无法 .to(device)（torchrl SyncDataCollector 建收集器时就会因此报
+        # "Cannot copy out of meta tensor"）。真正的权重在 self.params 里，
+        # 每次前向用 params.to_module() 热插拔进去。
+        object.__setattr__(self, "_empty_gru", empty_gru)
 
     def forward(
         self,
@@ -236,27 +299,41 @@ class MultiAgentGRU(torch.nn.Module):
         return output, h_n
 
     def run_net(self, input, is_init, h_0):
+        # [性能改造] 原来用 torch.vmap 逐 agent 跑（vmap 里走不了 cuDNN 融合 RNN）。
+        # 现在改成显式循环：每个 agent 把参数热插拔进 meta 模块单独调用（agent 数只有 1~2）。
+        # 实测 meta 热插拔相对真参数无开销（2.85ms vs 2.99ms），且数值完全一致。
         if not self.share_params:
-            if self.centralised:
-                output, h_n = self.vmap_func_module(
-                    self._empty_gru,
-                    (0, None, None, -3),
-                    (-2, -3),
-                )(self.params, input, is_init, h_0)
-            else:
-                output, h_n = self.vmap_func_module(
-                    self._empty_gru,
-                    (0, -2, -2, -3),
-                    (-2, -3),
-                )(self.params, input, is_init, h_0)
+            outputs, h_ns = [], []
+            for agent_idx in range(self.n_agents):
+                with self.params[agent_idx].to_module(self._empty_gru):
+                    if self.centralised:
+                        out, h_n = self._empty_gru(input, is_init, h_0[:, agent_idx])
+                    else:
+                        out, h_n = self._empty_gru(
+                            input[..., agent_idx, :],
+                            is_init[..., agent_idx, :],
+                            h_0[:, agent_idx],
+                        )
+                outputs.append(out)
+                h_ns.append(h_n)
+            output = torch.stack(outputs, dim=-2)
+            h_n = torch.stack(h_ns, dim=-3)
         else:
             with self.params.to_module(self._empty_gru):
                 if self.centralised:
                     output, h_n = self._empty_gru(input, is_init, h_0)
                 else:
-                    output, h_n = torch.vmap(
-                        self._empty_gru, in_dims=(-2, -2, -3), out_dims=(-2, -3)
-                    )(input, is_init, h_0)
+                    # 把 agent 维折进 batch，一次融合调用（先 permute 让 agent 位在 time 前）
+                    batch, seq, n_agents, feat = input.shape
+                    out, h_n = self._empty_gru(
+                        input.permute(0, 2, 1, 3).reshape(batch * n_agents, seq, feat),
+                        is_init.permute(0, 2, 1, 3).reshape(batch * n_agents, seq, 1),
+                        h_0.reshape(batch * n_agents, *h_0.shape[2:]),
+                    )
+                    output = out.view(batch, n_agents, seq, self.hidden_size).permute(
+                        0, 2, 1, 3
+                    )
+                    h_n = h_n.view(batch, n_agents, *h_n.shape[1:])
 
         return output, h_n
 
@@ -445,6 +522,9 @@ class Gru(Model):
             ],
             dim=-1,
         )
+        # [fp16 观测] 统一转 fp32 (环境可能输出半精度观测以节省内存)
+        if input.dtype != torch.float32:
+            input = input.float()
         debug_print(self.name, "Input tensor", input,
                    f"input_has_agent_dim={self.input_has_agent_dim}, "
                    f"output_has_agent_dim={self.output_has_agent_dim}, "

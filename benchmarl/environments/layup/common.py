@@ -6,13 +6,14 @@
 import copy
 from typing import Callable, Dict, List, Optional
 
+import numpy as np
 import torch
 import vmas
 from tensordict import TensorDictBase
 from torchrl.data import Composite, CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
 from torchrl.data.tensor_specs import Unbounded
 from torchrl.envs import EnvBase, TransformedEnv
-from torchrl.envs.transforms import Transform
+from torchrl.envs.transforms import CatFrames, Transform
 from torchrl.envs.libs.vmas import VmasEnv
 
 from benchmarl.environments.common import Task, TaskClass
@@ -169,6 +170,71 @@ class VmasEnvWithState(VmasEnv):
         return tensordict_out
 
 
+class StridedCatFrames(CatFrames):
+    """
+    [冒烟实验] 带采样间隔的 CatFrames。
+
+    CatFrames 每步都会写入一帧, 因此只能表达"最近 N 个连续步"。
+    本类每隔 ``stride`` 步才写入一帧, 用较少的帧覆盖更长的时间:
+        history_frames=5, stride=5, dt=0.1s -> 覆盖 5*5*0.1 = 2.0s, 维度只放大 5 倍。
+
+    实现: 继承 CatFrames, 仅在采样步复用其"滚动 + 写入"逻辑;
+    非采样步只把当前 buffer 回填到 tensordict (输出保持不变)。
+    """
+
+    def __init__(self, N: int, stride: int = 1, **kwargs):
+        super().__init__(N=N, **kwargs)
+        self.stride = int(stride)
+        if self.stride < 1:
+            raise ValueError(f"stride 必须 >= 1, 得到 {self.stride}")
+        self._stride_counter = 0
+
+    def _call(self, next_tensordict: TensorDictBase, _reset=None) -> TensorDictBase:
+        if self.stride == 1:
+            return super()._call(next_tensordict, _reset=_reset)
+
+        self._stride_counter += 1
+        _just_reset = _reset is not None
+        if _just_reset and bool(_reset.all()):
+            self._stride_counter = 1
+        is_sample = (self._stride_counter - 1) % self.stride == 0
+
+        for in_key, out_key in zip(self.in_keys, self.out_keys):
+            data = next_tensordict.get(in_key)
+            d = data.size(self.dim)
+            buffer_name = f"_cat_buffers_{in_key}"
+            buffer = getattr(self, buffer_name)
+            if isinstance(buffer, torch.nn.parameter.UninitializedBuffer):
+                buffer = self._make_missing_buffer(data, buffer_name)
+
+            shape = [1] * data.ndim
+            shape[self.dim] = self.N
+
+            if _just_reset and bool(_reset.all()):
+                # 全量 reset: 用当前帧填满整个历史窗口 (等价 padding="same")
+                buffer.copy_(data.repeat(shape))
+            else:
+                # 1) 采样步: 对"本步未 reset 的 env"执行滚动 + 写入最新帧
+                if is_sample:
+                    if _just_reset:
+                        keep = (~_reset).nonzero(as_tuple=True)[0]
+                        if keep.numel():
+                            sub = buffer[keep]
+                            sub.copy_(torch.roll(sub, shifts=-d, dims=self.dim))
+                            sub[..., -d:] = data[keep]
+                            buffer[keep] = sub
+                    else:
+                        buffer.copy_(torch.roll(buffer, shifts=-d, dims=self.dim))
+                        buffer[..., -d:] = data
+                # 2) 对本步 reset 的 env 用当前帧填满其历史窗口
+                if _just_reset:
+                    ridx = _reset.nonzero(as_tuple=True)[0]
+                    buffer[ridx] = data[ridx].repeat(shape)
+
+            next_tensordict.set(out_key, buffer.clone())
+        return next_tensordict
+
+
 class LayupClass(TaskClass):
     def get_env_fun(
         self,
@@ -224,6 +290,34 @@ class LayupClass(TaskClass):
             return env.group_map
         return {"agents": [agent.name for agent in env.agents]}
 
+    def get_env_transforms(self, env: EnvBase) -> List[Transform]:
+        """
+        [冒烟实验] 为无记忆的 MLP 提供固定窗口的历史观测。
+
+        对每个 agent group 的 observation 以及全局 state, 沿最后一维拼接最近
+        ``history_frames`` 帧 (每 ``history_stride`` 步采样一帧);
+        episode 结束时自动重置历史。
+        ``history_frames <= 0`` 时不添加任何 transform (原有 RNN 配置不受影响)。
+
+        例: history_frames=5, history_stride=5, dt=0.1s -> 覆盖 2.0s, 维度 x5。
+        """
+        history_frames = int(self.config.get("history_frames", 0) or 0)
+        if history_frames <= 0:
+            return []
+
+        history_stride = int(self.config.get("history_stride", 1) or 1)
+        in_keys = [(group, "observation") for group in self.group_map(env).keys()]
+        in_keys.append("state")
+        return [
+            StridedCatFrames(
+                N=history_frames,
+                stride=history_stride,
+                dim=-1,
+                in_keys=in_keys,
+                padding="same",
+            )
+        ]
+
     def state_spec(self, env: EnvBase) -> Optional[Composite]:
         if "state" in env.observation_spec:
             return Composite({"state": env.full_observation_spec_unbatched["state"].clone()})
@@ -265,6 +359,28 @@ class LayupClass(TaskClass):
     @staticmethod
     def env_name() -> str:
         return "vmas"
+
+    # --- [渲染降分辨率] 评估视频：2x2 块平均降采样，保持帧率不变 ---
+    # VMAS 默认把 4 个子场景拼成 (2*700)x(2*700) 的单帧（5.88MB/帧），
+    # 评估整段视频在内存里驻留会造成 ~2GB 峰值。这里在帧进入内存前
+    # 就降采样到 700x700（1.47MB/帧），再配合流式写盘。
+    @staticmethod
+    def render_callback(experiment, env: EnvBase, data: TensorDictBase):
+        frame = TaskClass.render_callback(experiment, env, data)
+        arr = (
+            frame.detach().cpu().numpy() if torch.is_tensor(frame) else np.asarray(frame)
+        )
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        if arr.ndim == 3 and arr.shape[0] % 2 == 0 and arr.shape[1] % 2 == 0:
+            h, w, c = arr.shape
+            arr = (
+                arr.reshape(h // 2, 2, w // 2, 2, c)
+                .mean(axis=(1, 3))
+                .round()
+                .astype(np.uint8)
+            )
+        return torch.from_numpy(arr) if torch.is_tensor(frame) else arr
 
 
 class LayupTask(Task):

@@ -454,6 +454,13 @@ def parse_args():
         help="checkpoint搜索模式",
     )
 
+    parser.add_argument(
+        "--max-iters",
+        type=int,
+        default=None,
+        help="覆盖实验的 max_n_iters (用于短程冒烟/监控, 不指定则使用 yaml 中的 4000)",
+    )
+
     # 模型调试日志参数
     parser.add_argument("--debug-log", action="store_true", help="启用模型调试日志")
 
@@ -619,6 +626,28 @@ if __name__ == "__main__":
     # 配置实验
     experiment_config = ExperimentConfig.get_from_yaml()
 
+    # [性能 A/B] 采集设备可由环境变量覆盖（cpu/cuda），用于对比策略推断开销
+    _sampling_device_env = os.environ.get("SAMPLING_DEVICE", None)
+    if _sampling_device_env:
+        print(
+            f"[OVERWRITE] sampling_device: {experiment_config.sampling_device} -> {_sampling_device_env}"
+        )
+        experiment_config.sampling_device = _sampling_device_env
+
+    # [性能] CPU 采集 bf16 加速：SAMPLING_AUTOCAST_BF16=1 时，策略前向在 CPU 上用 bf16
+    # autocast 计算（模型内部 bf16、输出仍转回 fp32），评测进程保持 fp32。
+    if os.environ.get("SAMPLING_AUTOCAST_BF16", "0") == "1":
+        print(
+            "[PERF] SAMPLING_AUTOCAST_BF16=1 -> CPU 采集策略前向使用 bf16 autocast（评测保持 fp32）"
+        )
+
+    # 可选: 覆盖最大迭代次数 (短程冒烟)
+    if args.max_iters is not None:
+        print(
+            f"[OVERWRITE] max_n_iters: {experiment_config.max_n_iters} -> {args.max_iters}"
+        )
+        experiment_config.max_n_iters = args.max_iters
+
     # 根据模式配置checkpoint（cont模式会设置restore_file）
     checkpoint = load_checkpoint_for_mode(
         experiment_config, args.mode, args.checkpoint, args.pattern
@@ -663,6 +692,16 @@ if __name__ == "__main__":
         {"attacker": attacker_algorithm_config, "defender": defender_algorithm_config}
     )
     # algorithm_config = MappoConfig.get_from_yaml()
+    # ==============================================================================
+    # 回到 Attention + GRU (v1–v5 的原结构, 见 tag snapshot-before-mlp-smoke)。
+    #   - 网络自带记忆 (GRU, 整段 150 步 BPTT), 因此不再需要环境侧历史堆叠:
+    #     task/vmas/layup.yaml 已设 history_frames=0 -> 单帧 obs 41 维 / state 23 维。
+    #   - 输入维度已与当前观测对齐 (本次修改):
+    #       attention_attacker.yaml / attention_defender.yaml: self_embed dim 7 -> 9
+    #       attention_critic.yaml: 23 维单帧 state, 无需改动
+    #   - attention.py 修复: 分组编码器的 One-Hot 身份改为"逐实例"分配,
+    #     否则 attacker 无法区分两个 defender (opponent_embed num=2)。
+    # ==============================================================================
     attacker_model_config = SequenceModelConfig(
         model_configs=[
             AttentionConfig.get_from_yaml(
@@ -671,10 +710,9 @@ if __name__ == "__main__":
             GruConfig.get_from_yaml(),
         ],
         intermediate_sizes=[
-            128
+            256
         ],  # Nuber of intermediate outputs. List of size n_layers - 1
     )
-    # attacker_model_config = AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_attacker.yaml")
     defender_model_config = SequenceModelConfig(
         model_configs=[
             AttentionConfig.get_from_yaml(
@@ -683,25 +721,23 @@ if __name__ == "__main__":
             GruConfig.get_from_yaml(),
         ],
         intermediate_sizes=[
-            128
+            256
         ],  # Nuber of intermediate outputs. List of size n_layers - 1
     )
-    # defender_model_config = AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_defender.yaml")
     model_config = EnsembleModelConfig(
         {"attacker": attacker_model_config, "defender": defender_model_config}
     )
     critic_model_config = AttentionConfig.get_from_yaml(
         "benchmarl/conf/model/layers/attention_critic.yaml"
     )
-    # critic_model_config = SequenceModelConfig(
-    #     model_configs=[
-    #         AttentionConfig.get_from_yaml("benchmarl/conf/model/layers/attention_critic.yaml"),
-    #         GruConfig.get_from_yaml(),
-    #     ],
-    #     intermediate_sizes=[
-    #         128
-    #     ],  # Nuber of intermediate outputs. List of size n_layers - 1
+
+    # --- [已停用] MLP + CatFrames 冒烟配置, 保留备查 ---
+    # attacker_model_config = MlpConfig.get_from_yaml("benchmarl/conf/model/layers/mlp.yaml")
+    # defender_model_config = MlpConfig.get_from_yaml("benchmarl/conf/model/layers/mlp.yaml")
+    # model_config = EnsembleModelConfig(
+    #     {"attacker": attacker_model_config, "defender": defender_model_config}
     # )
+    # critic_model_config = MlpConfig.get_from_yaml("benchmarl/conf/model/layers/mlp.yaml")
 
     # mamba
     # model_config = MambaConfig.get_from_yaml()
@@ -725,6 +761,23 @@ if __name__ == "__main__":
         ],
     )
     print("New experiment created.\n")
+
+    # [PERF] 打印实际生效的 PPO 系数（防"参数名写错被 torchrl 静默丢弃"再次发生）
+    _cfg_by_group = {
+        "attacker": attacker_algorithm_config,
+        "defender": defender_algorithm_config,
+    }
+    for _g, _loss in experiment.losses.items():
+        _line = [f"[LossCoef] {_g}:"]
+        for _k in ("entropy_coef", "critic_coef"):
+            _v = getattr(_loss, _k, None)
+            try:
+                _show = f"{float(_v):.4f}"
+            except (TypeError, ValueError):
+                _show = str(_v)
+            _want = getattr(_cfg_by_group.get(_g), _k, "?")
+            _line.append(f"{_k}={_show} (配置 {_want})")
+        print(" | ".join(_line))
 
     # 对于非cont模式，手动应用部分checkpoint加载
     apply_partial_checkpoint(experiment, checkpoint, args.mode)

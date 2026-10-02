@@ -54,16 +54,19 @@ max_n_frames: null
 n_workers: 1
 
 # Number of frames collected and each experiment iteration
+# [A2稀疏化/扩容] 150000 -> 225000: 与 n_envs 同比例放大, 保持每回合 150 步
 on_policy_collected_frames_per_batch: 300000
 # Number of environments used for collection
 # If the environment is vectorized, this will be the number of batched environments.
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
+# [A2稀疏化/扩容] 1000 -> 1500: 225000/1500 = 150 步/回合, 保持完整回合
 on_policy_n_envs_per_worker: 2000
 # This is the number of times collected_frames_per_batch will be split into minibatches and trained
 on_policy_n_minibatch_iters: 10
 # In on-policy algorithms the train_batch_size will be equal to the on_policy_collected_frames_per_batch
 # and it will be split into minibatches with this number of frames for training
-on_policy_minibatch_size: 20000
+# [A2稀疏化/扩容] 10000 -> 15000: 225000/15000 = 15 个 minibatch, 与原来一致
+on_policy_minibatch_size: 15000
 
 # Number of frames collected and each experiment iteration
 off_policy_collected_frames_per_batch: 81920
@@ -92,9 +95,10 @@ evaluation: True
 # Whether to render the evaluation (if rendering is available)
 render: True
 # Frequency of evaluation in terms of collected frames (this should be a multiple of on/off_policy_collected_frames_per_batch)
-evaluation_interval: 1500000
+# [A2稀疏化/扩容] 3000000 -> 4500000: 225000x20, 保持每 20 轮 eval 一次
+evaluation_interval: 4500000
 # Number of episodes that evaluation is run on
-evaluation_episodes: 16
+evaluation_episodes: 8
 # If True, when stochastic policies are evaluated, their deterministic value is taken, otherwise, if False, they are sampled
 evaluation_deterministic_actions: True
 # If True, seed the environment before evaluation leading to always the same evaluation env being used
@@ -102,7 +106,7 @@ evaluation_deterministic_actions: True
 evaluation_static: False
 
 # List of loggers to use, options are: wandb, csv, tensorboard, mflow
-loggers: [csv,tensorboard]
+loggers: [csv]
 # Wandb project name (kept for backward compatibility)
 project_name: "benchmarl"
 # Wandb extra kwargs passed to the WandbLogger (~superset of wandb.init kwargs)
@@ -124,7 +128,8 @@ restore_file: null
 restore_map_location: null
 # Interval for experiment saving in terms of collected frames (this should be a multiple of on/off_policy_collected_frames_per_batch).
 # Set it to 0 to disable checkpointing
-checkpoint_interval: 1500000
+# [扩容] 2250000 -> 3000000: 300000x10, 保持每 10 轮存一次（必须能被 collected_frames_per_batch 整除，否则永不存档）
+checkpoint_interval: 3000000
 # Whether to checkpoint when the experiment is done
 checkpoint_at_end: True
 # How many checkpoints to keep. As new checkpoints are taken, temporally older checkpoints are deleted to keep this number of
