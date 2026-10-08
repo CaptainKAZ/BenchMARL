@@ -442,6 +442,11 @@ def _evaluation_worker(
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     # 评测保持 fp32：不启用 CPU bf16 采样加速，保证评测数值与历史记录可比
     os.environ["SAMPLING_AUTOCAST_BF16"] = "0"
+    # [修复] 这个子进程不是从主进程的上下文里"继承"开关的（threading.local 在新进程里为空），
+    # 而复合动作策略要求 log_prob_keys（复数）=> 必须与 _setup() 一样显式关闭聚合，
+    # 否则 ProbabilisticActor 构造直接抛：
+    #   RuntimeError: composite_lp_aggregate is set to True but log_prob_keys were passed.
+    set_composite_lp_aggregate(False).set()
     seed_everything(seed)
 
     # --- 1. 初始化阶段 (仅执行一次) ---
@@ -914,21 +919,44 @@ class Experiment(CallbackNotifier):
                 env_func(), transforms_training.clone()
             )
 
-    def _make_optimizer(self, params, group: str = ""):
+    def _make_optimizer(self, params, group: str = "", loss_name: str = ""):
         """创建优化器。
 
         默认 AdamW；设置环境变量 USE_MUON=1 时改用 Muon(矩阵参数)+AdamW(其余)。
         可用环境变量调参：MUON_LR（默认 0.005）、MUON_MOMENTUM（0.95）、
         MUON_NS_STEPS（5）、MUON_WEIGHT_DECAY（0.0）、MUON_SCALE_MODE（shape|match_rms|none）。
+
+        ACTOR_LR_MULT（默认 1.0）：只作用于 loss_objective（actor）优化器的学习率倍数。
+        历史原因：去重前 actor 参数在同一组里出现两次、每步被更新两次（等效 ~2x lr），
+        现在的"统一网络"是 1x —— 想复现旧的有效步长就设 ACTOR_LR_MULT=2。
         """
         params = list(params)
+        # 去重：actor_network_params 持有器与网络本体可能引用同一批张量，重复入组会让同一参数
+        # 每步被更新两次（PyTorch 也会告警 "optimizer contains a parameter group with duplicate parameters"）。
+        seen_ids = set()
+        deduped = []
+        for p in params:
+            if id(p) not in seen_ids:
+                seen_ids.add(id(p))
+                deduped.append(p)
+        if len(deduped) != len(params):
+            print(f"[Optimizer] {group}: 参数去重 {len(params)} -> {len(deduped)}")
+        params = deduped
+
+        lr = float(self.config.lr)
+        lr_mult = 1.0
+        if loss_name == "loss_objective":
+            lr_mult = float(os.environ.get("ACTOR_LR_MULT", "1.0"))
+            lr = lr * lr_mult
+        if lr_mult != 1.0:
+            print(f"[Optimizer] {group}/{loss_name}: lr {self.config.lr:.3e} x{lr_mult:g} -> {lr:.3e}")
         if os.environ.get("USE_MUON", "0") == "1":
             from benchmarl.muon import MuonWithAdamW
 
-            muon_lr = float(os.environ.get("MUON_LR", "0.005"))
+            muon_lr = float(os.environ.get("MUON_LR", "0.005")) * lr_mult
             opt = MuonWithAdamW(
                 params,
-                lr=self.config.lr,
+                lr=lr,
                 muon_lr=muon_lr,
                 momentum=float(os.environ.get("MUON_MOMENTUM", "0.95")),
                 ns_steps=int(os.environ.get("MUON_NS_STEPS", "5")),
@@ -954,7 +982,7 @@ class Experiment(CallbackNotifier):
             return opt
         return torch.optim.AdamW(
             params,
-            lr=self.config.lr,
+            lr=lr,
             eps=self.config.adam_eps,
             weight_decay=1e-4,
         )
@@ -972,6 +1000,13 @@ class Experiment(CallbackNotifier):
             )
             for group in self.group_map.keys()
         }
+        # [BufferGuard] 记录"按当前配置应有的采样 batch 大小"：从旧 checkpoint 恢复 buffer
+        # 时会把 _batch_size 一起带回旧值（例如旧 run 是 minibatch 6000 -> 30 条序列），
+        # 那样 minibatch 调大只会减少优化步数、每步采样量不变（等价于偷偷减 PPO 遍数）。
+        self._configured_buffer_batch_size = {
+            group: getattr(self.replay_buffers[group], "_batch_size", None)
+            for group in self.group_map.keys()
+        }
         self.losses = {
             group: self.algorithm.get_loss_and_updater(group)[0]
             for group in self.group_map.keys()
@@ -982,7 +1017,7 @@ class Experiment(CallbackNotifier):
         }
         self.optimizers = {
             group: {
-                loss_name: self._make_optimizer(params, group)
+                loss_name: self._make_optimizer(params, group, loss_name)
                 for loss_name, params in self.algorithm.get_parameters(group).items()
             }
             for group in self.group_map.keys()
@@ -1345,6 +1380,20 @@ class Experiment(CallbackNotifier):
             training_start = time.time()
             # [PROF] 临时分段计时
             _prof = {}
+            # [MEM] 显存分段探针（PROF_MEM=1 时启用）
+            _mem_on = os.environ.get("PROF_MEM", "0") == "1"
+            if _mem_on:
+                torch.cuda.reset_peak_memory_stats()
+
+            def _memlog(tag):
+                if _mem_on:
+                    print(
+                        f"[MEM][{tag}] alloc={torch.cuda.memory_allocated() / 2**30:.2f}GB "
+                        f"peak_alloc={torch.cuda.max_memory_allocated() / 2**30:.2f}GB "
+                        f"reserved={torch.cuda.memory_reserved() / 2**30:.2f}GB",
+                        flush=True,
+                    )
+
             _active_groups = {} if _skip_train else self.train_group_map
             for group in _active_groups.keys():
                 _prof[group] = {}
@@ -1352,14 +1401,18 @@ class Experiment(CallbackNotifier):
                 group_batch = batch.exclude(*self._get_excluded_keys(group)).to(
                     self.config.train_device
                 )
+                _memlog(f"{group}:to_gpu")
                 _t1 = time.perf_counter()
                 group_batch = self.algorithm.process_batch(group, group_batch)
-                _t2 = time.perf_counter()
+                _b0 = time.perf_counter()
+                _memlog(f"{group}:process_batch")
+                _t2 = _b0
                 if not self.algorithm.has_rnn:
                     group_batch = group_batch.reshape(-1)
                 group_buffer = self.replay_buffers[group]
                 group_buffer.extend(group_batch.to(group_buffer.storage.device))
                 _t3 = time.perf_counter()
+                _memlog(f"{group}:extend")
                 self._prof_opt = {
                     "sample": 0.0,
                     "forward": 0.0,
@@ -1377,6 +1430,7 @@ class Experiment(CallbackNotifier):
                     ):
                         training_tds.append(self._optimizer_loop(group))
                 _t4 = time.perf_counter()
+                _memlog(f"{group}:opt_loops")
                 training_td = torch.stack(training_tds)
                 self.logger.log_training(
                     group, training_td, step=self.n_iters_performed
@@ -1546,9 +1600,123 @@ class Experiment(CallbackNotifier):
         excluded_keys += ["info", (group, "info"), ("next", group, "info")]
         return excluded_keys
 
+    # ==================== [NaN 取证] ====================
+    def _nan_finite_stats(self, t):
+        """返回 (nonfinite 数, numel, finite_min, finite_max)；全部 finite 时返回 None。"""
+        f = torch.isfinite(t)
+        n_bad = int((~f).sum())
+        if n_bad == 0:
+            return None
+        good = t[f]
+        mn = float(good.min()) if good.numel() else float("nan")
+        mx = float(good.max()) if good.numel() else float("nan")
+        return n_bad, int(t.numel()), mn, mx
+
+    def _iter_float_leaves(self, obj, prefix=""):
+        """递归遍历 TensorDict/dict/list，产出 (路径, 浮点张量)。"""
+        if torch.is_tensor(obj):
+            if obj.is_floating_point():
+                yield prefix, obj
+            return
+        if hasattr(obj, "items"):
+            for k, v in obj.items():
+                yield from self._iter_float_leaves(v, f"{prefix}/{k}" if prefix else str(k))
+            return
+        if isinstance(obj, (list, tuple)):
+            for i, v in enumerate(obj):
+                yield from self._iter_float_leaves(v, f"{prefix}[{i}]")
+
+    def _scan_nonfinite_td(self, td, tag, cap=5):
+        """[NaN 取证] 扫描浮点叶子，发现非有限就打印（每次实验最多 cap 条）。"""
+        rows = []
+        for key, val in self._iter_float_leaves(td):
+            st = self._nan_finite_stats(val)
+            if st is not None:
+                rows.append(
+                    f"    {key}: {st[0]}/{st[1]} finite[min,max]=[{st[2]:.4g},{st[3]:.4g}]"
+                )
+        if not rows:
+            return
+        self._nan_scan_reports = getattr(self, "_nan_scan_reports", 0)
+        if self._nan_scan_reports >= cap:
+            return
+        self._nan_scan_reports += 1
+        print(f"[NaNScan] {tag}: 非有限叶子 {len(rows)} 个")
+        for r in rows[:20]:
+            print(r)
+
+    def _dump_nan_case(self, group, loss_name, subdata, raw_loss_vals=None, cap=5):
+        """[NaN 取证] 非有限 loss 现场：打印 loss 分量 + subdata 非有限叶子（可选保存 subdata）。"""
+        self._nan_case_reports = getattr(self, "_nan_case_reports", 0)
+        if self._nan_case_reports >= cap:
+            return
+        self._nan_case_reports += 1
+        print(
+            f"[NaNCase] iter={self.n_iters_performed} group={group} loss={loss_name}",
+            flush=True,
+        )
+        if raw_loss_vals is not None:
+            for key, val in self._iter_float_leaves(raw_loss_vals):
+                st = self._nan_finite_stats(val)
+                if st is not None:
+                    print(f"[NaNCase]   loss[{key}] NONFINITE {st[0]}/{st[1]}")
+                else:
+                    mn = float(val.min()) if val.numel() else float("nan")
+                    mx = float(val.max()) if val.numel() else float("nan")
+                    print(f"[NaNCase]   loss[{key}] finite min={mn:.4g} max={mx:.4g}")
+        found = 0
+        for key, val in self._iter_float_leaves(subdata):
+            st = self._nan_finite_stats(val)
+            if st is not None:
+                found += 1
+                print(
+                    f"[NaNCase]   subdata {key}: {st[0]}/{st[1]} "
+                    f"finite[min,max]=[{st[2]:.4g},{st[3]:.4g}]"
+                )
+        print(f"[NaNCase]   subdata 非有限叶子合计 {found} 个", flush=True)
+        if os.environ.get("NAN_SAVE", "0") == "1":
+            path = f"/tmp/nan_case_iter{self.n_iters_performed}_{group}_{loss_name}.pt"
+            try:
+                torch.save(subdata.detach().cpu(), path)
+                print(f"[NaNCase]   saved subdata -> {path}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[NaNCase]   save failed: {e}", flush=True)
+
+    def _dump_nonfinite_grads(self, group, loss_name, optimizer, cap=5):
+        """[NaN 取证] 打印含非有限梯度的参数名。"""
+        self._nan_grad_reports = getattr(self, "_nan_grad_reports", 0)
+        if self._nan_grad_reports >= cap:
+            return
+        names = {}
+        try:
+            for name, p in self.losses[group].named_parameters():
+                names.setdefault(id(p), name)
+        except Exception:  # noqa: BLE001
+            pass
+        bad = []
+        for gi, pg in enumerate(optimizer.param_groups):
+            for p in pg.get("params", []):
+                if p is None or p.grad is None:
+                    continue
+                st = self._nan_finite_stats(p.grad)
+                if st is not None:
+                    bad.append((names.get(id(p), f"pg{gi}"), st))
+        if not bad:
+            return
+        self._nan_grad_reports += 1
+        print(
+            f"[NaNGrad] iter={self.n_iters_performed} group={group} loss={loss_name} "
+            f"非有限梯度参数 {len(bad)} 个",
+            flush=True,
+        )
+        for name, st in bad[:20]:
+            print(f"[NaNGrad]   {name}: {st[0]}/{st[1]} finite[min,max]=[{st[2]:.4g},{st[3]:.4g}]")
+
     def _optimizer_loop(self, group: str) -> TensorDictBase:
         _p0 = time.perf_counter()
         subdata = self.replay_buffers[group].sample().to(self.config.train_device)
+        if os.environ.get("NAN_DEBUG", "0") == "1":
+            self._scan_nonfinite_td(subdata, f"iter{self.n_iters_performed}/{group}/sample")
         _p1 = time.perf_counter()
 
         # 1. Forward pass (with mixed precision if enabled)
@@ -1586,6 +1754,7 @@ class Experiment(CallbackNotifier):
                         f"grad_norm_{loss_name}",
                         torch.tensor(float("nan"), device=_lv.device),
                     )
+                    self._dump_nan_case(group, loss_name, subdata, training_td)
                     continue
 
                 if self.config.use_amp and self.config.train_device != "cpu":
@@ -1622,6 +1791,7 @@ class Experiment(CallbackNotifier):
                                 f"[SafeTrain] 梯度非有限 ({group}/{loss_name})，跳过 optimizer.step()"
                                 f" | 累计 {self._nonfinite_grad_skips} 次"
                             )
+                            self._dump_nonfinite_grads(group, loss_name, optimizer)
                         optimizer.zero_grad()
                 else:
                     # Original FP32 training flow
@@ -1639,6 +1809,7 @@ class Experiment(CallbackNotifier):
                             f"[SafeTrain] 梯度非有限 ({group}/{loss_name})，跳过 optimizer.step()"
                             f" | 累计 {self._nonfinite_grad_skips} 次"
                         )
+                        self._dump_nonfinite_grads(group, loss_name, optimizer)
                     optimizer.zero_grad()
 
                 training_td.set(
@@ -1856,6 +2027,15 @@ class Experiment(CallbackNotifier):
                     self.replay_buffers[group].load_state_dict(
                         state_dict[f"buffer_{group}"]
                     )
+                    want = self._configured_buffer_batch_size.get(group)
+                    buf = self.replay_buffers[group]
+                    got = getattr(buf, "_batch_size", None)
+                    if want is not None and got != want:
+                        buf._batch_size = want
+                        print(
+                            f"[BufferGuard] {group}: 采样 batch 大小按当前配置对齐 "
+                            f"{got} -> {want}（checkpoint 内旧值与当前 minibatch 配置不一致）"
+                        )
                 else:
                     print(
                         f"[BufferGuard] 跳过 {group} 的 replay buffer 恢复："

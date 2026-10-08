@@ -10,11 +10,11 @@ import numpy as np
 import torch
 import vmas
 from tensordict import TensorDictBase
-from torchrl.data import Composite, CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
-from torchrl.data.tensor_specs import Unbounded
+from torchrl.data import Bounded, Categorical, Composite, Unbounded
 from torchrl.envs import EnvBase, TransformedEnv
 from torchrl.envs.transforms import CatFrames, Transform
 from torchrl.envs.libs.vmas import VmasEnv
+from torchrl.envs.utils import MarlGroupMapType
 
 from benchmarl.environments.common import Task, TaskClass
 from benchmarl.utils import DEVICE_TYPING
@@ -30,26 +30,10 @@ class FlattenHybridAction(Transform):
         self.continuous_dim = continuous_dim
         self.discrete_dim = discrete_dim
         self.discrete_n = discrete_n
-        self._debug_printed = False 
-        print(f"[DEBUG] FlattenHybridAction initialized. C={continuous_dim}, D={discrete_dim}")
+        self._debug_printed = False
 
     # [关键修复] forward 是处理 Observation 的，动作处理必须在 _inv_call 中！
     def _inv_call(self, tensordict: TensorDictBase) -> TensorDictBase:
-        # [DEBUG] 打印 tensordict 结构
-        if not self._debug_printed:
-            print(f"\n[DEBUG] FlattenHybridAction._inv_call (ACTION processing) CALLED.")
-            # 简略打印 Keys 确认数据流
-            root_keys = list(tensordict.keys())
-            print(f"[DEBUG] Root keys: {root_keys}")
-            for k in root_keys:
-                if k in ["attacker", "defender", "agents"]: # 打印 Agent Group 的内容
-                    item = tensordict.get(k)
-                    if isinstance(item, TensorDictBase) and "action" in item.keys():
-                        act = item.get("action")
-                        if isinstance(act, TensorDictBase):
-                            print(f"[DEBUG]   Group '{k}' action keys: {list(act.keys())}")
-            self._debug_printed = True
-
         root_keys = list(tensordict.keys())
         
         for key in root_keys:
@@ -86,32 +70,58 @@ class FlattenHybridAction(Transform):
     def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
         return tensordict
 
-    def transform_input_spec(self, input_spec: CompositeSpec) -> CompositeSpec:
+    def _continuous_bounds(self, original_spec):
+        """[速度范围 B] 读取原始动作 spec 前 continuous_dim 维的 (low, high)。
+
+        直接从原始 leaf spec 读取 ⇒ 自动跟随 v_max / action_size 变化（向前兼容）；
+        读不到上下界时返回 (None, None)，调用方退回 Unbounded（旧行为）。
         """
-        Step 2: 欺骗 Mappo (保留 Batch 维度)
-        """
-        if "full_action_spec" not in input_spec.keys():
-            return input_spec
-            
-        full_action_spec = input_spec["full_action_spec"]
-        
+        space = getattr(original_spec, "space", None)
+        low = getattr(space, "low", None) if space is not None else None
+        high = getattr(space, "high", None) if space is not None else None
+        if low is None or high is None:
+            low = getattr(original_spec, "low", None)
+            high = getattr(original_spec, "high", None)
+        if low is None or high is None:
+            return None, None
+        dev = getattr(original_spec, "device", None)
+        low = torch.as_tensor(low, dtype=torch.float32, device=dev)[..., : self.continuous_dim]
+        high = torch.as_tensor(high, dtype=torch.float32, device=dev)[..., : self.continuous_dim]
+        return low, high
+
+    def _hybridize(self, full_action_spec: Composite) -> Composite:
+        """把每个 group 的 "action" 叶子 spec 换成 {continuous, discrete} 复合 spec。"""
         for group_key in list(full_action_spec.keys()):
             group_spec = full_action_spec[group_key]
             if "action" not in group_spec.keys(): continue
                 
             original_spec = group_spec["action"]
-            if isinstance(original_spec, CompositeSpec): continue
+            if isinstance(original_spec, Composite): continue
 
             # 保留 Batch 维度
             target_shape = original_spec.shape[:-1]
             
-            new_spec = CompositeSpec(shape=target_shape, device=original_spec.device)
-            new_spec["continuous"] = UnboundedContinuousTensorSpec(
-                shape=target_shape + (self.continuous_dim,),
-                device=original_spec.device,
-                dtype=torch.float32
-            )
-            new_spec["discrete"] = DiscreteTensorSpec(
+            # [速度范围 B] 从原始动作叶子 spec 还原连续分量的物理上下界（±v_max）。
+            # 不还原的话 TanhNormal 退化成平凡边界 (−1,1)：策略只能输出 1 m/s，
+            # 且 loc 与事件空间失配会把 log_prob 推到 ~1e4（NaN 诱因，见 m08857 取证）。
+            cont_low, cont_high = self._continuous_bounds(original_spec)
+
+            new_spec = Composite(shape=target_shape, device=original_spec.device)
+            if cont_low is not None:
+                new_spec["continuous"] = Bounded(
+                    low=cont_low,
+                    high=cont_high,
+                    shape=target_shape + (self.continuous_dim,),
+                    device=original_spec.device,
+                    dtype=torch.float32
+                )
+            else:
+                new_spec["continuous"] = Unbounded(
+                    shape=target_shape + (self.continuous_dim,),
+                    device=original_spec.device,
+                    dtype=torch.float32
+                )
+            new_spec["discrete"] = Categorical(
                 n=self.discrete_n,
                 shape=target_shape + (self.discrete_dim,),
                 device=original_spec.device,
@@ -119,8 +129,21 @@ class FlattenHybridAction(Transform):
             )
             full_action_spec[group_key]["action"] = new_spec
 
+        return full_action_spec
+
+    def transform_input_spec(self, input_spec: Composite) -> Composite:
+        """
+        Step 2: 欺骗 Mappo (保留 Batch 维度)
+        """
+        if "full_action_spec" not in input_spec.keys():
+            return input_spec
+        input_spec["full_action_spec"] = self._hybridize(input_spec["full_action_spec"])
         return input_spec
-    
+
+    def transform_action_spec(self, action_spec: Composite) -> Composite:
+        # [投篮按键] TransformedEnv.action_spec 走这条；不写的话对外仍是 3 维连续 spec
+        return self._hybridize(action_spec)
+
 class VmasEnvWithState(VmasEnv):
     """
     带有全局状态支持的 VMAS 环境封装。
@@ -150,7 +173,33 @@ class VmasEnvWithState(VmasEnv):
         # 将 state 加入 observation spec，以便 BenchMARL 处理
         observation_spec_unbatched = self.observation_spec_unbatched
         observation_spec_unbatched["state"] = unbatched_state_spec_value
+
+        # [投篮按键] 在观测 spec 中声明组级 action_mask: [n_agents, 2] bool
+        # （Actor 观测 spec 会把它删掉，单独走 TaskClass.action_mask_spec -> mappo 的 mask 注入）
+        n_agents = len(self._env.scenario.world.agents)
+        group_key = next(iter(self.group_map))
+        observation_spec_unbatched[(group_key, "action_mask")] = Categorical(
+            n=2,
+            shape=(n_agents, 2),
+            dtype=torch.bool,
+            device=self.device,
+        )
         self.observation_spec_unbatched = observation_spec_unbatched
+
+    def _write_action_mask(self, tensordict_out: TensorDictBase) -> TensorDictBase:
+        # [投篮按键] 把场景的动作 mask 写进组子 td（与观测 spec 的 (group,"action_mask") 对齐）
+        getter = getattr(self._env.scenario, "get_action_mask", None)
+        if getter is None:
+            return tensordict_out
+        mask = getter()
+        has_next = "next" in tensordict_out.keys()
+        for group in self.group_map.keys():
+            tensordict_out.set((group, "action_mask"), mask)
+            # torchrl 的 step 输出约定：新一帧的数据在 "next" 下，step_mdp 之后才提升到根；
+            # 只写根的话会被 step_mdp 用旧值覆盖，所以两边都写。
+            if has_next:
+                tensordict_out.set(("next", group, "action_mask"), mask)
+        return tensordict_out
 
     def _reset(
         self, tensordict: TensorDictBase | None = None, **kwargs
@@ -158,7 +207,7 @@ class VmasEnvWithState(VmasEnv):
         tensordict_out = super()._reset(tensordict, **kwargs)
         state = self._env.scenario.get_global_state()
         tensordict_out.set("state", state)
-        return tensordict_out
+        return self._write_action_mask(tensordict_out)
 
     def _step(
         self,
@@ -167,7 +216,7 @@ class VmasEnvWithState(VmasEnv):
         tensordict_out = super()._step(tensordict)
         next_state = self._env.scenario.get_global_state()
         tensordict_out.set("state", next_state)
-        return tensordict_out
+        return self._write_action_mask(tensordict_out)
 
 
 class StridedCatFrames(CatFrames):
@@ -247,6 +296,9 @@ class LayupClass(TaskClass):
         
         # 1. 基础环境: 告诉 VMAS 这是一个连续动作环境
         # 即使我们想要离散逻辑，底层 VMAS 接口必须是连续的 (continuous_actions=True)
+        # [P0 单组化] 全部 4 个 agent 并成一个 "agents" 组，交给同一套共享主干网络。
+        # agent 顺序由 layup 场景保证: [attacker_1, attacker_2, defender_1, defender_2]
+        # => 角色映射 role_ids = [0(A1), 1(A2), 2(D), 2(D)]。
         base_env_fun = lambda: VmasEnvWithState(
             scenario=self.name.lower(),
             num_envs=num_envs,
@@ -254,6 +306,7 @@ class LayupClass(TaskClass):
             seed=seed,
             device=device, 
             clamp_actions=True,
+            group_map=MarlGroupMapType.ALL_IN_ONE_GROUP,
             **config,
         )
 
@@ -271,7 +324,9 @@ class LayupClass(TaskClass):
             )
             return env
 
-        return base_env_fun
+        # [投篮按键] 启用混合动作适配层（此前误返回 base_env_fun，导致动作 3 通道被
+        # 直接当作 3 维连续动作交给 VMAS）
+        return transformed_env_fun
 
     def supports_continuous_actions(self) -> bool:
         return True
@@ -323,7 +378,15 @@ class LayupClass(TaskClass):
             return Composite({"state": env.full_observation_spec_unbatched["state"].clone()})
 
     def action_mask_spec(self, env: EnvBase) -> Optional[Composite]:
-        return None
+        # [投篮按键] 与 SMACv2 约定一致：mask 放在 (group, "action_mask")；
+        # 从观测 spec 中剔除其余键，只保留 mask。
+        observation_spec = env.full_observation_spec_unbatched.clone()
+        for group in self.group_map(env):
+            if (group, "observation") in observation_spec.keys(True):
+                del observation_spec[(group, "observation")]
+        if "state" in observation_spec:
+            del observation_spec["state"]
+        return observation_spec
 
     def observation_spec(self, env: EnvBase) -> Composite:
         """
@@ -334,6 +397,9 @@ class LayupClass(TaskClass):
         for group in self.group_map(env):
             if "info" in observation_spec[group]:
                 del observation_spec[(group, "info")]
+            # [投篮按键] mask 不属于 Actor 观测
+            if (group, "action_mask") in observation_spec.keys(True):
+                del observation_spec[(group, "action_mask")]
         if "state" in observation_spec:
             del observation_spec["state"]
         return observation_spec
@@ -345,6 +411,9 @@ class LayupClass(TaskClass):
                  del info_spec[(group, "observation")]
             if (group, "critic_obs") in info_spec.keys(True):
                  del info_spec[(group, "critic_obs")]
+            # [投篮按键] mask 不属于 info
+            if (group, "action_mask") in info_spec.keys(True):
+                 del info_spec[(group, "action_mask")]
         for group in self.group_map(env):
             if "info" in info_spec[group]:
                 return info_spec

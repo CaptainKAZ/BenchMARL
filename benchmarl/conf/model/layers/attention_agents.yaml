@@ -1,0 +1,83 @@
+# ==============================================================================
+# BenchMARL / TorchRL Attention Model Configuration
+# [P0 单组化] 共享主干 + 角色条件化（A1 / A2 / 防守者）——actor
+# 4 个 agent 合并为一个 "agents" 组，共用这一套 Attention+GRU 主干；
+# 通过 role_ids = [0(A1), 1(A2), 2(D), 2(D)] 做角色条件化。
+# ==============================================================================
+
+name: attention
+
+# ------------------------------------------------------------------------------
+# 1. 模型核心超参数 (Model Hyperparameters)
+# ------------------------------------------------------------------------------
+embedding_dim: 128          # 内部特征映射维度
+num_heads: 4                # 注意力头数
+num_attention_layers: 2     # Transformer 层数
+ffn_multiplier: 4           # FFN 隐藏层倍数 (128 * 4 = 512)
+dropout_prob: 0.0           # 强化学习建议设为 0
+final_mlp_hidden_layers: [256]
+
+# 【关键配置】启用 Ego-Embedding 模式
+use_ego_embedding: True
+
+# ego 聚合带宽：self token ⊕ 其余 token 均值（128 → 256）
+ego_pool: mean
+
+# ------------------------------------------------------------------------------
+# 1.5 [P0 单组化] 角色条件化配置
+# ------------------------------------------------------------------------------
+# 角色嵌入会注入 ego token，并用于角色分组的输出头。
+role_ids: [0, 1, 2, 2]      # agent 顺序: attacker_1, attacker_2, defender_1, defender_2
+n_roles: 3                  # A1 / A2 / 防守者（D1=D2 共用角色）
+role_embedding_dim: 32      # [P0-A] 16 -> 32，加厚角色条件化
+# [P0-B+] 观察者角色专属编码器：每个角色（A1/A2/D）一套 encoder，
+# 让"进攻方眼里的对手"和"防守方眼里的对手"从编码层就分开，而不是只靠 ego token 的角色嵌入。
+# 注意：开启会改变参数键名（encoders.*.weight -> encoders.*.N.weight），与旧 checkpoint 不兼容，
+# 只能在 cold 启动时置 true；v36 及其自动续跑期间保持 false 以兼容现有 checkpoint。
+# [v37] cold 启动，已开启（用户确认）。
+encoders_per_role: true
+
+# ------------------------------------------------------------------------------
+# 2. 编码器分组策略 (Encoder Grouping Strategy)
+# ------------------------------------------------------------------------------
+encoder_groups:
+  players:
+    features:
+      - teammate_embed
+      - opponent1_embed
+      - opponent2_embed
+
+# ------------------------------------------------------------------------------
+# 3. 忽略列表 (Ignore Features)
+# ------------------------------------------------------------------------------
+# 注意：不能忽略 spot_embed —— 进攻方需要它；防守方观测中该维度为 0。
+ignore_features:
+
+# ------------------------------------------------------------------------------
+# 4. 输入特征解析 (Input Parsing)
+# ------------------------------------------------------------------------------
+# 观测结构 (41维): self 9维, 每个非自己 agent 8维, spot/basket 各 4维
+input_feature_order:
+  - self_embed        # -> Index 0 (9维, Ego Token)
+  - teammate_embed    # -> Index 1 (8维)
+  - opponent1_embed   # -> Index 2 (8维)
+  - opponent2_embed   # -> Index 3 (8维)
+  - spot_embed        # -> Index 4 (4维)
+  - basket_embed      # -> Index 5 (4维)
+
+roles:
+  entity:
+    - self_embed
+    - teammate_embed
+    - opponent1_embed
+    - opponent2_embed
+    - spot_embed
+    - basket_embed
+
+definitions:
+  self_embed:      { dim: 9, num: 1 }   # pos(2)+vel(2)+上帧动作(2)+in_spot(1)+读条进度(1)+剩余时间(1)
+  teammate_embed:  { dim: 8, num: 1 }
+  opponent1_embed: { dim: 8, num: 1 }
+  opponent2_embed: { dim: 8, num: 1 }
+  spot_embed:      { dim: 4, num: 1 }
+  basket_embed:    { dim: 4, num: 1 }

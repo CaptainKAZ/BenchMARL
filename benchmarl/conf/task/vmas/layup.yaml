@@ -2,12 +2,23 @@ defaults:
   - vmas_layup_config
   - _self_
 
-max_steps: 150
+max_steps: 200  # [2026-10-03 用户] 150 -> 200：与 t_limit=20s / dt=0.1 对齐，整局 200 步
 
-# --- 固定初始位置 + Attention+GRU (网络自带记忆，不再堆叠历史帧) ---
-fixed_init: true
+# --- Attention+GRU (网络自带记忆，不再堆叠历史帧) ---
+# fixed_init: A2 / D1 / D2 初始位置固定（A1 始终固定起点）。关闭 = 三者随机出生，
+# 避免 A2 开局总能“预对齐”插到两名防守者中间。
+fixed_init: false
 fixed_spot: false
 # history_frames <= 0 时不添加 CatFrames transform:
 # 单帧观测 41 维、全局 state 23 维, 记忆交给 GRU (整段 150 步 BPTT)
 history_frames: 0
 history_stride: 2
+
+# --- [感知噪声] 队友/对手观测加入"随距离增大"的高斯噪声（模拟真实感知误差）---
+# sigma_pos = perception_noise_floor + k_perception_noise * 距离 (米)
+# sigma_vel = perception_noise_vel_floor + k_perception_noise_vel * 距离 (米/秒)
+# 参考量级: 距离 9m 处位置误差 ~0.29m（≈一个球员半径）。四项全设 0 = 关闭噪声。
+k_perception_noise: 0.02
+perception_noise_floor: 0.05
+k_perception_noise_vel: 0.01
+perception_noise_vel_floor: 0.02

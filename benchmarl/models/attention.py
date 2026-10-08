@@ -8,7 +8,7 @@ from tensordict import TensorDictBase
 from torch import nn
 from torchrl.modules import MLP, MultiAgentMLP
 
-from benchmarl.models.common import Model, ModelConfig
+from benchmarl.models.common import Model, ModelConfig, output_has_agent_dim
 from benchmarl.models.debug_utils import debug_print, debug_separator
 
 class AttentionBlock(nn.Module):
@@ -42,6 +42,107 @@ class AttentionBlock(nn.Module):
         x_flat = x_flat + self.dropout(self.ffn(x_norm))
         return x_flat.view(orig_shape)
 
+
+class RoleConditionedMLP(nn.Module):
+    """[P0 单组化] 共享主干的"角色条件化"输出头。
+
+    输入 ``[..., n_agents, in_dim]``，输出 ``[..., n_agents, out_dim]``：
+      1. 角色嵌入拼接到每个 agent 的特征后面（共享主干随后处理）；
+      2. 输出层按角色分组（n_roles 个独立 Linear），使 A1/A2/D 各有自己的输出头。
+    这样 4 个 agent 共享同一主干、只在最后的输出层按角色特化（3 个策略/价值头）。
+
+    [投篮按键] ``role_out_dims`` 可给每个角色不同的输出宽度（如 [6, 4, 4]：
+    A1 输出 6 个动作参数 = 4 个连续 loc/scale + 2 个离散 logits，其余角色只输出
+    4 个连续参数）；宽度不足的输出用 0 补齐到 ``out_dim``（= max(role_out_dims)），
+    由适配层与 layup 场景忽略补齐位。
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        hidden_layers: List[int],
+        role_ids: List[int],
+        n_roles: int,
+        role_embedding_dim: int = 16,
+        device: str | torch.device = "cpu",
+        role_out_dims: Optional[List[int]] = None,
+    ):
+        super().__init__()
+        self.role_ids = list(role_ids)
+        self.n_roles = int(n_roles)
+        # [投篮按键] 每个角色各自的输出宽度（缺省全部 = out_dim）
+        if role_out_dims is not None and len(role_out_dims) > 0:
+            assert len(role_out_dims) == self.n_roles, (
+                f"role_out_dims 长度 {len(role_out_dims)} 与 n_roles {self.n_roles} 不一致"
+            )
+            self.role_out_dims = [int(d) for d in role_out_dims]
+        else:
+            self.role_out_dims = [int(out_dim)] * self.n_roles
+        self.out_dim = max(self.role_out_dims)
+        self.role_embedding = nn.Embedding(self.n_roles, role_embedding_dim, device=device)
+        hidden = list(hidden_layers) if hidden_layers else []
+        trunk_hidden = hidden if len(hidden) > 0 else [in_dim + role_embedding_dim]
+        self.trunk = MLP(
+            in_features=in_dim + role_embedding_dim,
+            out_features=trunk_hidden[-1],
+            num_cells=trunk_hidden,
+            activation_class=nn.GELU,
+            device=device,
+            norm_class=nn.LayerNorm,
+            norm_kwargs={"eps": 1e-5, "normalized_shape": trunk_hidden[0]},
+        )
+        # [P0-A] per-role 输出头加宽为 2 层（共享 trunk 之后按角色特化）
+        self.heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(trunk_hidden[-1], trunk_hidden[-1], device=device),
+                    nn.GELU(),
+                    nn.Linear(trunk_hidden[-1], self.role_out_dims[r], device=device),
+                )
+                for r in range(self.n_roles)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ids = torch.as_tensor(self.role_ids, device=x.device)
+        emb = self.role_embedding(ids)  # [n_agents, role_emb_dim]
+        emb = emb.expand(*x.shape[:-2], -1, -1)  # [..., n_agents, role_emb_dim]
+        h = self.trunk(torch.cat([x, emb], dim=-1))  # [..., n_agents, trunk_hidden]
+        outs = []
+        for i, rid in enumerate(self.role_ids):
+            o = self.heads[rid](h[..., i, :])
+            pad = self.out_dim - o.shape[-1]
+            if pad > 0:
+                # [投篮按键] 非 A1 角色只输出连续参数，补齐 0 到统一宽度
+                o = torch.cat(
+                    [o, torch.zeros(*o.shape[:-1], pad, device=o.device, dtype=o.dtype)],
+                    dim=-1,
+                )
+            outs.append(o)
+        return torch.stack(outs, dim=-2)
+
+
+class RoleFiLM(nn.Module):
+    """[P0-A] 逐层角色 FiLM 调制（AdaLN 风格）。
+
+    对 attention 层输出的 token 序列按角色做 ``x -> x * (1 + scale) + shift``：
+    角色嵌入由共享的 ``role_embedding_ego`` 提供，每个调制层拥有自己的线性头。
+    ``to_film`` 零初始化 -> 训练初期等价于恒等映射，不破坏已学表示。
+    """
+
+    def __init__(self, embedding_dim: int, role_embedding_dim: int, device: str | torch.device = "cpu"):
+        super().__init__()
+        self.to_film = nn.Linear(role_embedding_dim, embedding_dim * 2, device=device)
+        nn.init.zeros_(self.to_film.weight)
+        nn.init.zeros_(self.to_film.bias)
+
+    def forward(self, x: torch.Tensor, role_emb: torch.Tensor) -> torch.Tensor:
+        # x: [rows, tokens, dim]；role_emb: [rows, role_emb_dim]
+        scale, shift = self.to_film(role_emb).chunk(2, dim=-1)
+        return x * (1.0 + scale.unsqueeze(-2)) + shift.unsqueeze(-2)
+
+
 class Attention(Model):
     def __init__(
         self,
@@ -60,6 +161,11 @@ class Attention(Model):
         ignore_features: List[str] = None,
         share_params_override: Optional[bool] = None,
         share_params_final_mlp: Optional[bool] = None,
+        role_ids: Optional[List[int]] = None,
+        n_roles: int = 0,
+        role_embedding_dim: int = 32,
+        use_role_film: bool = True,
+        encoders_per_role: bool = False,
         **kwargs,
     ):
         # ✅ 先保存配置（_perform_checks 需要用到）
@@ -72,6 +178,13 @@ class Attention(Model):
         self.ego_pool = ego_pool
         self.ignore_features = set(ignore_features) if ignore_features else set()
         self.encoder_groups_config = encoder_groups or {}
+        # [P0 单组化] 角色条件化：role_ids[i] 表示第 i 个 agent 的角色编号（如 A1=0/A2=1/D=2）
+        self.role_ids = list(role_ids) if role_ids else []
+        self.n_roles = int(n_roles)
+        self.role_embedding_dim = int(role_embedding_dim)
+        self._role_enabled = len(self.role_ids) > 0 and self.n_roles > 0
+        # [P0-A] 是否启用逐层角色 FiLM 调制（默认开；可关做消融）
+        self.use_role_film = bool(use_role_film)
         compile_attention_blocks = kwargs.pop('compile_attention_blocks', False)
         compile_mode = kwargs.pop('compile_mode', 'default')
 
@@ -81,9 +194,36 @@ class Attention(Model):
         # ✅ 然后调用基类初始化（会调用 _perform_checks）
         super().__init__(**kwargs)
 
+        # [P0 单组化] 校验角色映射与 agent 数量一致
+        if self._role_enabled and len(self.role_ids) != self.n_agents:
+            raise ValueError(
+                f"role_ids 长度 {len(self.role_ids)} 与 n_agents {self.n_agents} 不一致"
+            )
+
+        # [P0-B] 记录 override 之前的 share_params：用于判断"输出是否应带 agent 维"。
+        # 共享 trunk + 角色价值头的 critic 需要 share_params=True（一次前向 + 展开），
+        # 但输出仍是每角色一个价值 [n_agents, 1]（由 spec 决定），二者必须解耦。
+        # share_params 经 **kwargs 传给基类，这里先从 kwargs 取出用于输出几何判断
+        self._spec_share_params = kwargs.get("share_params", False)
+
         # ✅ [NEW] 允许覆盖 share_params (实现混合架构的关键：Shared Attention + Independent GRU)
         if share_params_override is not None:
             self.share_params = share_params_override
+
+        # [P0-B+] 观察者角色专属编码器：每个角色一套 encoder（前端就区分"谁在看什么"）。
+        # 仅在"共享主干 + 有 agent 维 + 启用角色"时生效；critic 的全局状态输入无 agent 维，不适用。
+        self.use_role_encoders = bool(
+            encoders_per_role
+            and self._role_enabled
+            and self.share_params
+            and self.input_has_agent_dim
+        )
+        # 角色 -> agent 索引（role_ids=[0,1,2,2] -> [[0],[1],[2,3]]），供按角色分组编码使用
+        self.role_agent_indices = (
+            [[i for i, r in enumerate(self.role_ids) if r == rr] for rr in range(self.n_roles)]
+            if self._role_enabled
+            else []
+        )
 
         # ✅ [NEW] 保存 final MLP 的独立共享配置（如果未设置则跟随 self.share_params）
         self.share_params_final_mlp = share_params_final_mlp if share_params_final_mlp is not None else self.share_params
@@ -93,6 +233,22 @@ class Attention(Model):
         self.grouped_features: Set[str] = set()
         self.feature_map: Dict[str, Tuple[str, int]] = {}
         self._init_encoders()
+
+        # [P0 单组化] 角色嵌入（注入 actor 的 ego token，让共享主干知道"我是谁"）
+        if self._role_enabled and self.role_embedding_dim > 0:
+            self.role_embedding_ego = nn.Embedding(
+                self.n_roles, self.role_embedding_dim, device=self.device
+            )
+            # 投影到 token 维度，避免与 ego token 直接相加时维度不匹配
+            if self.role_embedding_dim != self.embedding_dim:
+                self.role_proj_ego = nn.Sequential(
+                    nn.Linear(
+                        self.role_embedding_dim,
+                        self.embedding_dim,
+                        device=self.device,
+                    ),
+                    nn.SiLU(),
+                )
 
         # Transformer 主干
         # ✅ 根据 share_params 决定创建 1 组还是 n_agents 组 attention layers
@@ -107,6 +263,21 @@ class Attention(Model):
         else:
             self.attention_layers = nn.ModuleList([
                 AttentionBlock(embedding_dim, num_heads, ffn_multiplier, dropout_prob, device=self.device)
+                for _ in range(num_attention_layers)
+            ])
+
+        # [P0-A] 逐层角色 FiLM 调制模块（仅在"有 agent 维 + 共享主干 + 启用角色"时创建；
+        # 非共享分支的 attention_layers 是 ModuleList of ModuleList，故不加；
+        # 全局状态输入的 critic 走 broadcast 展开，FiLM 无法按角色调制，同样不加）
+        self.role_film = None
+        if (
+            self._role_enabled
+            and self.use_role_film
+            and self.share_params
+            and self.input_has_agent_dim
+        ):
+            self.role_film = nn.ModuleList([
+                RoleFiLM(self.embedding_dim, self.role_embedding_dim, device=self.device)
                 for _ in range(num_attention_layers)
             ])
 
@@ -216,7 +387,13 @@ class Attention(Model):
             self.register_buffer(f"{group_name}_id", torch.eye(num_types, device=self.device))
 
             # ✅ 根据 share_params 决定创建 1 个还是 n_agents 个编码器
-            if not self.share_params:
+            if getattr(self, "use_role_encoders", False):
+                # [P0-B+] 每个角色一套编码器（前端即区分"谁在看"）
+                self.encoders[group_name] = nn.ModuleList([
+                    nn.Linear(base_dim + num_types, self.embedding_dim, device=self.device)
+                    for _ in range(self.n_roles)
+                ])
+            elif not self.share_params:
                 self.encoders[group_name] = nn.ModuleList([
                     nn.Linear(base_dim + num_types, self.embedding_dim, device=self.device)
                     for _ in range(self.n_agents)
@@ -228,7 +405,13 @@ class Attention(Model):
         for name in self.roles.get('entity', []):
             if name not in self.ignore_features and name not in self.grouped_features:
                 # ✅ 根据 share_params 决定创建 1 个还是 n_agents 个编码器
-                if not self.share_params:
+                if getattr(self, "use_role_encoders", False):
+                    # [P0-B+] 每个角色一套编码器
+                    self.encoders[name] = nn.ModuleList([
+                        nn.Linear(self.definitions[name]['dim'], self.embedding_dim, device=self.device)
+                        for _ in range(self.n_roles)
+                    ])
+                elif not self.share_params:
                     self.encoders[name] = nn.ModuleList([
                         nn.Linear(self.definitions[name]['dim'], self.embedding_dim, device=self.device)
                         for _ in range(self.n_agents)
@@ -256,6 +439,19 @@ class Attention(Model):
             mlp_in = (num_entities * self.embedding_dim) + global_dim
 
         mlp_out = self.output_leaf_spec.shape[-1]
+
+        # [P0 单组化] 角色条件化输出头：共享主干 + 3 个按角色分组的输出头
+        if self._role_enabled and self.output_has_agent_dim:
+            self.final_mlp = RoleConditionedMLP(
+                in_dim=mlp_in,
+                out_dim=mlp_out,
+                hidden_layers=hidden_layers,
+                role_ids=self.role_ids,
+                n_roles=self.n_roles,
+                role_embedding_dim=self.role_embedding_dim,
+                device=self.device,
+            )
+            return
 
         # ✅ 关键：使用 output_has_agent_dim 属性决定 MLP 类型
         if self.output_has_agent_dim:
@@ -290,6 +486,19 @@ class Attention(Model):
                     for _ in range(self.n_agents if not self.share_params_final_mlp else 1)
                 ]
             )
+
+    @property
+    def output_has_agent_dim(self) -> bool:
+        """[P0-B] 覆盖基类属性：用 ``share_params_override`` 之前的 share_params 计算。
+
+        基类用 ``share_params``/``centralised`` 动态判断输出是否带 agent 维。当 critic
+        通过 ``share_params_override=True`` 启用"共享 trunk + 角色价值头"时，输出仍必须
+        是每个 agent 一个价值（[n_agents, 1]，由 spec 声明），因此这里用 override 之前的
+        share_params 判断，使"参数共享"与"输出几何"解耦。
+        """
+        return output_has_agent_dim(
+            getattr(self, "_spec_share_params", self.share_params), self.centralised
+        )
 
     def _forward(self, tensordict: TensorDictBase) -> TensorDictBase:
         debug_separator(self.name, "FORWARD START")
@@ -393,6 +602,31 @@ class Attention(Model):
             return torch.cat([ego, others], dim=-1)
         return ego
 
+    def _encode_entity(self, name: str, inp: torch.Tensor) -> torch.Tensor:
+        """实体特征编码。
+
+        - 普通模式：共享 encoder（或 share_params=False 时由 _forward_unshared 处理）；
+        - 角色专属模式（``use_role_encoders``）：按 agent 的角色分组，各角色用自己的 encoder。
+          ``inp`` 的 agent 维为 -3（形状 [..., n_agents, num_entities, feat_dim]）。
+        """
+        enc = self.encoders[name]
+        if isinstance(enc, nn.ModuleList):
+            if not getattr(self, "use_role_encoders", False):
+                raise RuntimeError(
+                    f"_forward_shared 被调用，但编码器 '{name}' 是 ModuleList 且未启用角色专属编码！"
+                )
+            parts, idx_all = [], []
+            for rr, idx in enumerate(self.role_agent_indices):
+                if not idx:
+                    continue
+                idx_t = torch.as_tensor(idx, device=inp.device, dtype=torch.long)
+                parts.append(enc[rr](inp.index_select(-3, idx_t)))
+                idx_all.append(idx_t)
+            idx_all = torch.cat(idx_all)
+            # 按角色顺序拼接，再用 argsort 还原成原始 agent 顺序（纯索引操作，无原地写入）
+            return torch.cat(parts, dim=-3).index_select(-3, torch.argsort(idx_all))
+        return enc(inp)
+
     def _forward_shared(self, input_tensor: torch.Tensor) -> torch.Tensor:
         """共享参数模式：所有 agent 使用相同的编码器和注意力层"""
         debug_print(self.name, "[_forward_shared] Input tensor", input_tensor)
@@ -408,34 +642,43 @@ class Attention(Model):
 
             if name in self.grouped_features:
                 g_name, t_idx = self.feature_map[name]
-                encoder = self.encoders[g_name]
-                if isinstance(encoder, nn.ModuleList):
-                    raise RuntimeError(
-                        f"_forward_shared 被调用，但编码器 '{g_name}' 是 ModuleList！"
-                    )
                 ids = getattr(self, f"{g_name}_id")[t_idx]
                 ids = ids.view(*([1]*(entity_data.dim()-1)), -1).expand(*entity_data.shape[:-1], -1)
-                embedded = encoder(torch.cat([entity_data, ids], dim=-1))
-                embedded_entities.append(embedded)
+                embedded = self._encode_entity(g_name, torch.cat([entity_data, ids], dim=-1))
             else:
-                encoder = self.encoders[name]
-                if isinstance(encoder, nn.ModuleList):
-                    raise RuntimeError(
-                        f"_forward_shared 被调用，但编码器 '{name}' 是 ModuleList！"
-                    )
-                embedded = encoder(entity_data)
-                embedded_entities.append(embedded)
+                embedded = self._encode_entity(name, entity_data)
+            embedded_entities.append(embedded)
 
         sequence = torch.cat(embedded_entities, dim=-2)
         debug_print(self.name, "[_forward_shared] Sequence after embedding", sequence)
+
+        # [P0 单组化] 角色嵌入注入 ego token（token 0 = self 实体），
+        # 让共享的注意力主干知道当前 agent 的角色（A1 / A2 / 防守者）。
+        if getattr(self, "_role_enabled", False) and hasattr(self, "role_embedding_ego"):
+            ids = torch.as_tensor(self.role_ids, device=sequence.device)
+            ego_emb = self.role_embedding_ego(ids)  # [n_agents, role_emb_dim]
+            if hasattr(self, "role_proj_ego"):
+                ego_emb = self.role_proj_ego(ego_emb)  # [n_agents, embedding_dim]
+            sequence = sequence.clone()
+            sequence[..., 0, :] = sequence[..., 0, :] + ego_emb
 
         # 3. Attention 处理
         pre_attn_shape = sequence.shape
         flat_sequence = sequence.flatten(0, -3)
         debug_print(self.name, "[_forward_shared] Flat sequence", flat_sequence)
 
+        # [P0-A] 逐层角色 FiLM：flat 展平顺序为 (..., n_agents)，agent 在最快变化的维度
+        role_emb_rows = None
+        if getattr(self, "role_film", None) is not None:
+            ids_r = torch.as_tensor(self.role_ids, device=flat_sequence.device)
+            emb_r = self.role_embedding_ego(ids_r)  # [n_agents, role_emb_dim]
+            n_lead = flat_sequence.shape[0] // self.n_agents
+            role_emb_rows = emb_r.repeat(n_lead, 1)  # [rows, role_emb_dim]
+
         for i, layer in enumerate(self.attention_layers):
             flat_sequence = layer(flat_sequence)
+            if role_emb_rows is not None and i < len(self.role_film):
+                flat_sequence = self.role_film[i](flat_sequence, role_emb_rows)
             debug_print(self.name, f"[_forward_shared] After attention layer {i}", flat_sequence)
 
         sequence = flat_sequence.view(pre_attn_shape)
@@ -620,6 +863,14 @@ class AttentionConfig(ModelConfig):
     ignore_features: List[str] = field(default_factory=list)
     share_params_override: Optional[bool] = None
     share_params_final_mlp: Optional[bool] = None
+    # [P0 单组化] 角色条件化：role_ids[i] = 第 i 个 agent 的角色编号
+    role_ids: List[int] = field(default_factory=list)
+    n_roles: int = 0
+    role_embedding_dim: int = 32
+    # [P0-A] 逐层角色 FiLM 调制开关（消融用）
+    use_role_film: bool = True
+    # [P0-B+] 观察者角色专属编码器开关（每个角色一套 encoder，仅 actor 的带 agent 维输入生效）
+    encoders_per_role: bool = False
 
     # ✅ 编译配置（学习自 GRU）
     compile_attention_blocks: bool = True  # 是否编译 AttentionBlock

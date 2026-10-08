@@ -16,8 +16,13 @@ final_mlp_hidden_layers: [256,256]
 
 use_ego_embedding: False
 
-# share_params_override: True
-# share_params_final_mlp: False
+# [P0-B] 共享主干：一次前向出 4 个价值（取代原先"按 agent 循环 4 次"的实现）
+share_params_override: True
+
+# [P0 单组化] 角色条件化：critic 一次前向输出 4 个 agent 的价值（3 个角色头）
+role_ids: [0, 1, 2, 2]
+n_roles: 3
+role_embedding_dim: 32      # [P0-A] 16 -> 32
 
 
 # ------------------------------------------------------------------------------

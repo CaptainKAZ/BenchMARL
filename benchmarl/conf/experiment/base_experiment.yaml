@@ -51,6 +51,7 @@ max_n_iters: 4000
 # Number of collected frames before ending, exclusive with max_n_iters
 max_n_frames: null
 
+# [2026-10-03] 回退 2 -> 1: MultiSyncDataCollector 走 spawn 需 pickle 策略，而复合策略含局部类 CompositePolicy + 多个 lambda（不可 pickle）-> 需先重构才能用多进程采集
 n_workers: 1
 
 # Number of frames collected and each experiment iteration
@@ -60,13 +61,18 @@ on_policy_collected_frames_per_batch: 300000
 # If the environment is vectorized, this will be the number of batched environments.
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
 # [A2稀疏化/扩容] 1000 -> 1500: 225000/1500 = 150 步/回合, 保持完整回合
-on_policy_n_envs_per_worker: 2000
+# [2026-10-03 用户] 整局 150 -> 200 步：帧数保持 300000，环境数 2000 -> 1500，使 rollout 长度 T=300000/1500=200 覆盖整局
+# [2026-10-03] 回退 750 -> 1500: 配合 n_workers=1
+on_policy_n_envs_per_worker: 1500
 # This is the number of times collected_frames_per_batch will be split into minibatches and trained
+# [2026-10-03 用户] 保持 10：PPO 遍数影响参数更新速度/质量，不动
 on_policy_n_minibatch_iters: 10
 # In on-policy algorithms the train_batch_size will be equal to the on_policy_collected_frames_per_batch
 # and it will be split into minibatches with this number of frames for training
 # [A2稀疏化/扩容] 10000 -> 15000: 225000/15000 = 15 个 minibatch, 与原来一致
-on_policy_minibatch_size: 15000
+# [显存] 15000 -> 6000: WSL 下 15000 帧 minibatch(100 序列 x T150 x 4 agent) 的激活峰值达 8.45GB,
+# push GPU 到 12GB 顶格后溢出到系统内存导致训练奇慢; 6000 帧约压到 1/2.5
+on_policy_minibatch_size: 12000
 
 # Number of frames collected and each experiment iteration
 off_policy_collected_frames_per_batch: 81920
@@ -98,7 +104,8 @@ render: True
 # [A2稀疏化/扩容] 3000000 -> 4500000: 225000x20, 保持每 20 轮 eval 一次
 evaluation_interval: 4500000
 # Number of episodes that evaluation is run on
-evaluation_episodes: 8
+# [提速 2026-10-03] 8 -> 4: 减半评测开销（每 15 轮一次）
+evaluation_episodes: 4
 # If True, when stochastic policies are evaluated, their deterministic value is taken, otherwise, if False, they are sampled
 evaluation_deterministic_actions: True
 # If True, seed the environment before evaluation leading to always the same evaluation env being used
@@ -129,7 +136,9 @@ restore_map_location: null
 # Interval for experiment saving in terms of collected frames (this should be a multiple of on/off_policy_collected_frames_per_batch).
 # Set it to 0 to disable checkpointing
 # [扩容] 2250000 -> 3000000: 300000x10, 保持每 10 轮存一次（必须能被 collected_frames_per_batch 整除，否则永不存档）
-checkpoint_interval: 3000000
+# [抗崩] 3000000 -> 1500000: 300000x5, 每 5 轮存一次。GPU 偶发 unknown error 会让进程直接死掉，
+# 上次崩在 iter579 而最近存档是 iter570（丢 9 轮）=> 缩短间隔把最坏损失压到 ≤5 轮。
+checkpoint_interval: 1500000
 # Whether to checkpoint when the experiment is done
 checkpoint_at_end: True
 # How many checkpoints to keep. As new checkpoints are taken, temporally older checkpoints are deleted to keep this number of

@@ -258,135 +258,143 @@ class WinRateReport(Callback):
         self.experiment.train_group_map = new_train_map
 
 
-class WinRateReportDebounced(Callback):
+
+class WinRateReportSimple(Callback):
     """
-    一个自定义回调，根据胜率动态调整训练的智能体组。
-    增加了防抖（滞后）机制：
-    1. 当胜率 < low_threshold (0.3) -> 进入进攻方特训，直到胜率回升至 recovery_threshold (0.5)。
-    2. 当胜率 > high_threshold (0.7) -> 进入防守方特训，直到胜率回落至 recovery_threshold (0.5)。
+    [P0 单组化] 只统计并打印进攻方胜率与终局分布，不再切换训练组（课程逻辑已移除）。
+
+    单组 "agents" (A1/A2/D1/D2) 全部一起训练，胜率仅作为监控指标。
     """
 
-    def __init__(
-        self, win_rate_threshold: float = 0.3, recovery_threshold: float = 0.58
-    ):
-        self.win_rate_threshold = win_rate_threshold
-        self.high_threshold = 1.0 - win_rate_threshold
-        self.recovery_threshold = recovery_threshold
-
-        # 状态变量：'normal', 'fix_attacker', 'fix_defender'
-        self.current_mode = "normal"
-
-        self.original_group_map = None
-        print(
-            f"[WinRateCurriculum] Callback initialized. Low: {self.win_rate_threshold}, High: {self.high_threshold}, Target: {self.recovery_threshold}"
-        )
+    def __init__(self):
+        print("[WinRateReport] Callback initialized (single-group, no curriculum).")
 
     def on_setup(self):
-        self.original_group_map = self.experiment.train_group_map.copy()
         print(
-            f"[WinRateCurriculum] Setup complete. Original training groups: {list(self.original_group_map.keys())}"
+            f"[WinRateReport] Setup complete. Training groups: {list(self.experiment.train_group_map.keys())}"
         )
 
     def on_batch_collected(self, batch: TensorDictBase):
-        # 默认基础是所有组
-        new_train_map = self.original_group_map.copy()
-
         try:
-            # --- 1. 计算胜率逻辑 (保持你原有的逻辑不变) ---
             done_info = batch.get(("next", "done"))
+            # 单组下 termination_reason 形状 [T, B, n_agents, 1]，index 0 = A1（进攻方）
             reason_codes_tensor = batch.get(
-                ("next", "attacker", "info", "termination_reason")
+                ("next", "agents", "info", "termination_reason")
             )[..., 0, :]
             reason_codes = reason_codes_tensor.squeeze(-1)
             dones_mask = done_info.squeeze(-1).bool()
             terminated_codes_in_batch = reason_codes[dones_mask]
 
-            # 假设 log_and_calculate_win_rate 是外部可用的函数
             win_rate = log_and_calculate_win_rate(
                 terminated_codes_in_batch, {1, 2, 3, 4, 5}
             )
-            total_dones_in_batch = done_info.sum().item()
-
-            print(f"Win rate: {win_rate:.2f} | Current Mode: {self.current_mode}")
-
-            # 预热期不调整
-            if self.experiment.n_iters_performed < 20:
-                self.experiment.train_group_map = new_train_map
-                return
-
-            # 如果没有结束的回合or数据不足，保持上一次的状态设置，直接返回
-            if total_dones_in_batch <= 1000:
-                # 保持当前的 train_group_map 不变 (或者沿用上一次的 new_train_map)
-                # 这里为了安全，我们重新应用基于当前 mode 的 map
-                self._apply_mode_to_map(new_train_map)
-                self.experiment.train_group_map = new_train_map
-                return
-
-            # --- 2. 状态机逻辑 (防抖核心) ---
-
-            if self.current_mode == "normal":
-                # 检查是否需要进入特训模式
-                if win_rate < self.win_rate_threshold:
-                    self.current_mode = "fix_attacker"
-                    print(
-                        f"!!! Attacker is too weak ({win_rate:.2f} < {self.win_rate_threshold}). Locking training to ATTACKER."
-                    )
-                elif win_rate > self.high_threshold:
-                    self.current_mode = "fix_defender"
-                    print(
-                        f"!!! Defender is too weak ({win_rate:.2f} > {self.high_threshold}). Locking training to DEFENDER."
-                    )
-
-            elif self.current_mode == "fix_attacker":
-                # 进攻方特训中：只有胜率回到 0.5 以上才解除
-                if win_rate >= self.recovery_threshold:
-                    self.current_mode = "normal"
-                    print(
-                        f">>> Attacker recovered ({win_rate:.2f} >= {self.recovery_threshold}). Resuming NORMAL training."
-                    )
-                else:
-                    # 保持现状
-                    pass
-
-            elif self.current_mode == "fix_defender":
-                # 防守方特训中：只有胜率(进攻方胜率)降回到 0.5 以下才解除
-                if win_rate <= (1 - self.recovery_threshold):
-                    self.current_mode = "normal"
-                    print(
-                        f">>> Defender recovered ({win_rate:.2f} <= {1 - self.recovery_threshold}). Resuming NORMAL training."
-                    )
-                else:
-                    # 保持现状
-                    pass
-
-            # --- 3. 根据最终确定的 Mode 修改训练组 ---
-            self._apply_mode_to_map(new_train_map)
-
-        except (KeyError, AttributeError) as e:
             print(
-                f"\n[WinRateCurriculum] Error computing win rate ({e}). Defaulting to all groups."
+                f"Win rate: {win_rate:.2f} | total dones: {int(dones_mask.sum().item())}"
             )
-            pass
-
-        # 更新实验设置
-        self.experiment.train_group_map = new_train_map
-
-    def _apply_mode_to_map(self, train_map):
-        """辅助函数：根据当前模式修改字典"""
-        if self.current_mode == "fix_attacker":
-            if "defender" in train_map:
-                del train_map["defender"]
-        elif self.current_mode == "fix_defender":
-            if "attacker" in train_map:
-                del train_map["attacker"]
-        # normal 模式下不删除任何键，保持默认
-
+        except (KeyError, AttributeError) as e:
+            print(f"\n[WinRateReport] Could not compute win rate ({e}).")
 
 from health_check import HealthCheckCallback
 from reward_histogram_callback import (
     RewardHistogramCallback,
     RewardDistributionCallback,
 )
+
+
+class GradConflictCallback(Callback):
+    """[P0-D] 共享主干梯度冲突监控（每 N 轮打印一次，绝不打断训练）。
+
+    对 buffer 中同一个 minibatch 分别只用攻方(A1/A2)/守方(D1/D2)的 advantage
+    反传 PPO 目标（loss_objective + loss_entropy），得到共享主干上的两组梯度，
+    打印其余弦相似度与 per-role 头权重范数，作为"共享主干是否正在被攻守撕扯"的判据。
+    """
+
+    def __init__(self, log_interval: int = 10, probe_batch: int = 1024, group: str = "agents"):
+        self.log_interval = int(log_interval)
+        self.probe_batch = int(probe_batch)
+        self.group = group
+        self._calls = 0
+
+    @staticmethod
+    def _flatten_grads(params):
+        grads = [p.grad.detach().reshape(-1) for p in params if p.grad is not None]
+        if not grads:
+            return None
+        return torch.cat(grads)
+
+    def on_batch_collected(self, batch: TensorDictBase):
+        self._calls += 1
+        if self.log_interval <= 0 or self._calls % self.log_interval != 0:
+            return
+        try:
+            exp = self.experiment
+            loss = exp.losses[self.group]
+            buf = exp.replay_buffers[self.group]
+            actor = loss.actor_network
+            device = exp.config.train_device
+
+            td = buf.sample()
+            if td.shape[0] > self.probe_batch:
+                td = td[: self.probe_batch]
+            td = td.to(device)
+
+            # 共享主干参数（排除角色专属模块：角色嵌入 / FiLM / 各角色输出头）
+            role_specific = ("role_embedding", "role_proj", "role_film", "heads")
+            trunk = [
+                p
+                for name, p in actor.named_parameters()
+                if not any(k in name for k in role_specific)
+            ]
+
+            adv_key = loss.tensor_keys.advantage
+            masks = {"A": [1.0, 1.0, 0.0, 0.0], "D": [0.0, 0.0, 1.0, 1.0]}
+            grads = {}
+            for tag, m in masks.items():
+                td_masked = td.clone()
+                adv = td_masked.get(adv_key)
+                shape = [1] * adv.dim()
+                shape[-2] = len(m)
+                mask = torch.as_tensor(m, device=adv.device, dtype=adv.dtype).view(shape)
+                td_masked.set(adv_key, adv * mask)
+                for p in trunk:
+                    p.grad = None
+                loss_vals = loss(td_masked)
+                total = loss_vals.get("loss_objective")
+                ent = loss_vals.get("loss_entropy", None)
+                if ent is not None:
+                    total = total + ent
+                total.backward()
+                grads[tag] = self._flatten_grads(trunk)
+                del td_masked, loss_vals
+
+            # 清理残留梯度，避免污染正式训练
+            for p in actor.parameters():
+                p.grad = None
+
+            ga, gd = grads.get("A"), grads.get("D")
+            if ga is not None and gd is not None:
+                cos = torch.nn.functional.cosine_similarity(
+                    ga.unsqueeze(0), gd.unsqueeze(0)
+                ).item()
+                print(
+                    f"[GradConflict] calls={self._calls} | cos(攻,守)={cos:+.3f} "
+                    f"| ||g_A||={ga.norm():.2f} ||g_D||={gd.norm():.2f}"
+                )
+            else:
+                print(f"[GradConflict] calls={self._calls} | 无有效梯度")
+
+            head_norms = []
+            for mod in actor.modules():
+                if mod.__class__.__name__ == "RoleConditionedMLP":
+                    for rid, head in enumerate(mod.heads):
+                        n = sum(float(p.detach().pow(2).sum()) for p in head.parameters()) ** 0.5
+                        head_norms.append((rid, n))
+            if head_norms:
+                txt = " ".join(f"r{rid}={n:.2f}" for rid, n in head_norms)
+                print(f"[GradConflict] per-role 头范数: {txt}")
+        except Exception as e:  # 诊断逻辑绝不打断训练
+            print(f"[GradConflict] skipped ({type(e).__name__}: {e})")
+
 
 # checkpoint_path = "outputs/2025-07-06_19-39-05/mappo_layup_gru__c217740f_25_07_06-19_39_05/checkpoints"
 checkpoint_pattern = "outputs/**/checkpoints/*.pt"
@@ -523,6 +531,23 @@ def load_checkpoint_for_mode(experiment_config, mode, checkpoint_path, pattern):
     print(f"\n[LOADING] Checkpoint: {checkpoint_path}")
 
     if mode == "cont":
+        # [P0 单组化] 兼容性校验：旧 checkpoint 属 attacker/defender 分组架构，无法续训新模型
+        try:
+            _ck_keys = list(
+                torch.load(
+                    checkpoint_path, map_location="cpu", mmap=True, weights_only=False
+                ).keys()
+            )
+        except Exception as _e:
+            _ck_keys = []
+            print(f"[P0] checkpoint 预检失败（忽略）: {_e}")
+        if _ck_keys and "loss_agents" not in _ck_keys:
+            raise SystemExit(
+                "[P0 单组化] 该 checkpoint 属于旧的 attacker/defender 分组架构"
+                "（无 'loss_agents'），与单组共享主干模型不兼容。\n"
+                "           请用 cold 模式从零开始训练。"
+            )
+
         # 使用 experiment_config.restore_file 恢复完整状态
         print("[CONTINUE] Setting restore_file for full state recovery...")
         experiment_config.restore_file = checkpoint_path
@@ -572,6 +597,14 @@ def load_actor_only(experiment, checkpoint, group):
 def apply_partial_checkpoint(experiment, checkpoint, mode):
     """在实验创建后应用部分checkpoint加载"""
     if checkpoint is None:
+        return
+
+    # [P0 单组化] 旧分组架构的 checkpoint 与新单组网络不兼容，直接跳过并提示
+    if "loss_agents" not in checkpoint:
+        print(
+            "[P0 单组化] checkpoint 不含 'loss_agents'（旧 attacker/defender 分组架构），"
+            "与单组共享主干模型不兼容 -> 跳过部分加载。请用 cold 模式从零训练。"
+        )
         return
 
     if mode == "atk-c" or mode == "atk-ac":
@@ -680,53 +713,25 @@ if __name__ == "__main__":
     # 使用您重构后的新环境
     new_task = LayupTask.LAYUP.get_from_yaml()
 
-    attacker_algorithm_config = MappoConfig.get_from_yaml()
-    attacker_algorithm_config.share_param_actor = False
-    attacker_algorithm_config.share_param_critic = False
-    defender_algorithm_config = MappoConfig.get_from_yaml()
-    defender_algorithm_config.share_param_actor = True
-    defender_algorithm_config.share_param_critic = True
-    print(f"attacker algo: {attacker_algorithm_config}")
-    print(f"defender algo: {defender_algorithm_config}")
-    algorithm_config = EnsembleAlgorithmConfig(
-        {"attacker": attacker_algorithm_config, "defender": defender_algorithm_config}
-    )
-    # algorithm_config = MappoConfig.get_from_yaml()
-    # ==============================================================================
-    # 回到 Attention + GRU (v1–v5 的原结构, 见 tag snapshot-before-mlp-smoke)。
-    #   - 网络自带记忆 (GRU, 整段 150 步 BPTT), 因此不再需要环境侧历史堆叠:
-    #     task/vmas/layup.yaml 已设 history_frames=0 -> 单帧 obs 41 维 / state 23 维。
-    #   - 输入维度已与当前观测对齐 (本次修改):
-    #       attention_attacker.yaml / attention_defender.yaml: self_embed dim 7 -> 9
-    #       attention_critic.yaml: 23 维单帧 state, 无需改动
-    #   - attention.py 修复: 分组编码器的 One-Hot 身份改为"逐实例"分配,
-    #     否则 attacker 无法区分两个 defender (opponent_embed num=2)。
-    # ==============================================================================
-    attacker_model_config = SequenceModelConfig(
+    # [P0 单组化] 4 个 agent (A1/A2/D1/D2) 一个组 "agents"，共享一套主干网络：
+    #   - actor: 共享 Attention+GRU 主干 + 角色条件化输出头（role_ids=[0,1,2,2] → 3 个角色头）
+    #   - critic: 单网络一次前向输出 4 个价值 (share_param_critic=False => 输出 (n_agents,1))
+    agent_algorithm_config = MappoConfig.get_from_yaml()
+    agent_algorithm_config.share_param_actor = True
+    agent_algorithm_config.share_param_critic = False
+    algorithm_config = agent_algorithm_config
+    print(f"agents algo: {agent_algorithm_config}")
+
+    agent_model_config = SequenceModelConfig(
         model_configs=[
             AttentionConfig.get_from_yaml(
-                "benchmarl/conf/model/layers/attention_attacker.yaml"
+                "benchmarl/conf/model/layers/attention_agents.yaml"
             ),
             GruConfig.get_from_yaml(),
         ],
-        intermediate_sizes=[
-            256
-        ],  # Nuber of intermediate outputs. List of size n_layers - 1
+        intermediate_sizes=[256],
     )
-    defender_model_config = SequenceModelConfig(
-        model_configs=[
-            AttentionConfig.get_from_yaml(
-                "benchmarl/conf/model/layers/attention_defender.yaml"
-            ),
-            GruConfig.get_from_yaml(),
-        ],
-        intermediate_sizes=[
-            256
-        ],  # Nuber of intermediate outputs. List of size n_layers - 1
-    )
-    model_config = EnsembleModelConfig(
-        {"attacker": attacker_model_config, "defender": defender_model_config}
-    )
+    model_config = agent_model_config
     critic_model_config = AttentionConfig.get_from_yaml(
         "benchmarl/conf/model/layers/attention_critic.yaml"
     )
@@ -746,6 +751,26 @@ if __name__ == "__main__":
     # model_config = MlpConfig.get_from_yaml()
     # critic_model_config = model_config
 
+    # [LiveView] 观察窗回调（LIVE_VIEW=1 时启用）：每迭代从 replay buffer 取一条环境序列写 JSON
+    _callbacks = [
+        WinRateReportSimple(),
+        RewardHistogramCallback(log_interval=5),
+        RewardDistributionCallback(log_interval=5),
+        GradConflictCallback(log_interval=10),
+    ]
+    if os.environ.get("LIVE_VIEW", "0") == "1":
+        try:
+            import sys as _sys
+            _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            # 观察窗组件（live_view.py / live_view.html / 面板服务）在 BenchMARL/liveview/
+            _sys.path.insert(0, os.path.join(_repo_root, "BenchMARL", "liveview"))
+            from live_view import LiveViewCallback
+            _live_out = os.environ.get("LIVE_OUT", "outputs/live")
+            _callbacks.append(LiveViewCallback(out_dir=_live_out))
+            print(f"[LiveView] 已挂载观察窗回调，输出 {_live_out}/live_env.json")
+        except Exception as _e:
+            print(f"[LiveView] 挂载失败，跳过: {type(_e).__name__}: {_e}")
+
     # 创建一个全新的实验对象，所有状态都是初始化的
     experiment = Experiment(
         task=new_task,
@@ -754,19 +779,11 @@ if __name__ == "__main__":
         critic_model_config=critic_model_config,
         seed=114514,
         config=experiment_config,
-        callbacks=[
-            WinRateReportDebounced(),
-            RewardHistogramCallback(log_interval=5),
-            RewardDistributionCallback(log_interval=5),
-        ],
+        callbacks=_callbacks,
     )
     print("New experiment created.\n")
 
     # [PERF] 打印实际生效的 PPO 系数（防"参数名写错被 torchrl 静默丢弃"再次发生）
-    _cfg_by_group = {
-        "attacker": attacker_algorithm_config,
-        "defender": defender_algorithm_config,
-    }
     for _g, _loss in experiment.losses.items():
         _line = [f"[LossCoef] {_g}:"]
         for _k in ("entropy_coef", "critic_coef"):
@@ -775,7 +792,7 @@ if __name__ == "__main__":
                 _show = f"{float(_v):.4f}"
             except (TypeError, ValueError):
                 _show = str(_v)
-            _want = getattr(_cfg_by_group.get(_g), _k, "?")
+            _want = getattr(agent_algorithm_config, _k, "?")
             _line.append(f"{_k}={_show} (配置 {_want})")
         print(" | ".join(_line))
 

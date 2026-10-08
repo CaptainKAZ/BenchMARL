@@ -27,6 +27,6 @@ normalize_advantage_exclude_dims: [-2]
 # [稳定化] 有界策略头 (仅 use_tanh_normal 时生效)。v27 NaN 的诱因之一是策略头 loc/scale 漂移,
 # 动作长期贴 tanh 饱和边界, 训练侧反解 log_prob 达 1e6 量级。限幅后 loc∈(−3,3)、scale∈(0.01,1.0)。
 bounded_tanh_params: True
-loc_bound: 3.0
+loc_bound: 3.0  # 速度上限 = upscale·tanh(loc_bound)：upscale=5、loc=3 ⇒ ≈4.98 m/s，已几乎用满 v_max。3.0 足够（2026-10-03 由 5.0 改回）
 scale_min: 0.01
 scale_max: 1.0

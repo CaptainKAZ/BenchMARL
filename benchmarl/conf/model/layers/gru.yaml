@@ -14,3 +14,11 @@ mlp_activation_kwargs: null
 mlp_norm_class: torch.nn.LayerNorm
 mlp_norm_kwargs:
   normalized_shape: 256
+
+# [P0-C] 角色条件化动作头：GRU 之后按角色分叉的 loc/scale 输出头
+role_ids: [0, 1, 2, 2]      # agent 顺序: attacker_1, attacker_2, defender_1, defender_2
+n_roles: 3                  # A1 / A2 / 防守者（D1=D2 共用角色）
+role_embedding_dim: 32
+# [投篮按键] per-role 输出宽度：A1 = 4 连续 loc/scale + 2 离散 logits；
+# A2/D = 只输出 4 个连续参数（补 0 到 6，离散位由 mask 恒为"不按"）
+role_out_dims: [6, 4, 4]

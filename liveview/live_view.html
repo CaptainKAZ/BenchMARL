@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Layup 训练面板</title>
+<style>
+  :root { --bg:#0b1016; --panel:#121a24; --panel2:#0e151d; --fg:#e8eef5; --dim:#93a1b1; --line:#22303f;
+          --accent:#4c8dff; }
+  * { box-sizing: border-box; }
+  html,body { height:100%; }
+  body { margin:0; color:var(--fg); overflow:hidden; padding:10px 12px; display:flex; flex-direction:column; gap:8px;
+         background:radial-gradient(1100px 520px at 18% -12%, #17222f 0, var(--bg) 62%);
+         font:13px/1.45 -apple-system,"Segoe UI","Microsoft YaHei UI","Microsoft YaHei","PingFang SC","Noto Sans SC",system-ui,sans-serif; }
+  button { background:linear-gradient(#1c2634,#151d27); color:var(--fg); border:1px solid var(--line); border-radius:8px;
+           padding:5px 11px; cursor:pointer; font:inherit; transition:border-color .15s,filter .15s,transform .05s; }
+  button:hover { border-color:var(--accent); filter:brightness(1.12); }
+  button:active { transform:translateY(1px); }
+  select, input[type=number] { background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+           border-radius:8px; padding:3px 7px; font:inherit; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  .dim { color:var(--dim); }
+  .row { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .kv { display:flex; justify-content:space-between; border-bottom:1px solid #1b2531; padding:2px 0; gap:10px; }
+  .kv:last-child { border-bottom:0; }
+  .kv > span { color:var(--dim); }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:4px; }
+  h3 { margin:2px 0 2px; font-size:12.5px; color:#c9d6e4; letter-spacing:.06em; }
+  ::-webkit-scrollbar { width:9px; height:9px; }
+  ::-webkit-scrollbar-thumb { background:#26323f; border-radius:6px; }
+  ::-webkit-scrollbar-track { background:transparent; }
+
+  #statusline { flex:0 0 auto; color:var(--dim); background:var(--panel2); border:1px solid var(--line);
+                border-radius:9px; padding:5px 10px; }
+
+  #page { flex:1 1 auto; min-height:0; display:grid;
+          grid-template-columns:minmax(0,1.06fr) minmax(0,1fr); gap:10px; }
+
+  /* ---- 左：观察窗（画布 + 侧栏） ---- */
+  #pane-live { display:flex; gap:9px; min-height:0; min-width:0; }
+  #canvasbox { flex:1 1 auto; min-width:0; min-height:0; display:flex; align-items:center; justify-content:center; }
+  #big { background:#fcfcf8; border-radius:10px; box-shadow:0 10px 34px #0009, 0 0 0 1px #ffffff10; display:block; }
+  #side { width:276px; flex:0 0 auto; display:flex; flex-direction:column; gap:6px; min-height:0; overflow:auto; padding-right:2px; }
+  #eps { display:grid; grid-template-columns:1fr 1fr; gap:4px; }
+  .chip { display:flex; gap:6px; align-items:center; text-align:left; border-left:4px solid #666; border-radius:7px;
+          padding:3px 7px; font-size:11.5px; line-height:1.3; }
+  .chip.sel { outline:2px solid var(--accent); background:#1b2735; }
+  .chip b { color:var(--dim); font-weight:500; }
+  .chip span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #stat { padding:7px 9px; background:var(--panel2); border:1px solid var(--line); border-radius:9px; font-size:11.5px; }
+  #legend { font-size:11.5px; color:var(--dim); line-height:1.6; }
+  .playbtn { padding:5px 16px; font-weight:700; }
+  .playbtn.playing { background:linear-gradient(#2f7cff,#1f5fe0); border-color:#2f7cff; }
+  #errline { color:#ff7b72; font-size:11.5px; white-space:pre-wrap; }
+
+  /* ---- 右上：胜率曲线 ---- */
+  #pane-curve { flex:1 1 54%; display:flex; flex-direction:column; gap:5px; min-height:0; }
+  #curvebox { flex:1 1 auto; min-height:0; position:relative; background:var(--panel2); border:1px solid var(--line);
+              border-radius:10px; padding:8px; }
+  #curveChart { width:100%; height:100%; }
+  .codetog { display:flex; gap:10px; flex-wrap:wrap; align-items:center; font-size:11.5px; }
+  .codetog label { display:flex; gap:3px; align-items:center; cursor:pointer; }
+
+  /* ---- 右下：日志 ---- */
+  #pane-log { flex:1 1 46%; display:flex; flex-direction:column; gap:5px; min-height:0; }
+  #logbox { flex:1 1 auto; min-height:0; background:#0a0f15; border:1px solid var(--line); border-radius:10px;
+            padding:8px 10px; overflow:auto; white-space:pre-wrap; word-break:break-all; font-size:11.5px; margin:0;
+            font-family:"Cascadia Mono",Consolas,"JetBrains Mono",ui-monospace,monospace; }
+
+  /* ==================== 移动端 / 窄屏 ====================
+     手机竖屏（<=860px）：改为纵向滚动排布【观察窗 → 曲线 → 日志】，触控目标加大；
+     手机横屏（短高度）：恢复左右两栏，避免高视口把日志挤没。 */
+  @media (max-width: 860px) {
+    html,body { height:auto; }
+    body { overflow:auto; padding:8px; gap:8px; font-size:12.5px; -webkit-text-size-adjust:100%; }
+    #statusline { padding:6px 9px; line-height:1.5; }
+    #page { display:flex; flex-direction:column; gap:10px; min-height:0; }
+
+    /* 观察窗：画布在上、控制/统计在下 */
+    #pane-live { flex-direction:column; gap:10px; }
+    #canvasbox { height:58vh; min-height:320px; }
+    #side { width:auto; overflow:visible; padding-right:0; gap:8px; }
+
+    /* 触控目标（≥40px 高，便于手指点击） */
+    button { padding:9px 13px; }
+    .playbtn { padding:9px 18px; }
+    input[type=range] { height:36px; }
+    select, input[type=number] { padding:7px 8px; }
+    input[type=checkbox] { width:19px; height:19px; }
+    .chip { padding:7px 8px; font-size:12px; }
+    #eps { gap:6px; }
+    #stat, #legend { font-size:12px; }
+
+    /* 曲线 / 日志：给固定高度，纵向滚动查看 */
+    #pane-curve, #pane-log { flex:none; }
+    #curvebox { height:300px; flex:none; }
+    #logbox { height:44vh; min-height:240px; }
+    #pane-curve > .row, #pane-log > .row { row-gap:5px; }
+    .codetog { gap:9px; }
+  }
+
+  /* 手机横屏：宽、矮 —— 回到左右两栏，所有高度按视口分配（内边距/字号继续用上面的加大量） */
+  @media (orientation: landscape) and (max-height: 560px) {
+    html,body { height:100%; }
+    body { overflow:hidden; }
+    #page { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px; min-height:0; }
+    #pane-live { flex-direction:row; gap:6px; }
+    #canvasbox { height:auto; min-height:0; }
+    #side { width:172px; overflow:auto; }
+    /* 右列恢复“曲线 / 日志”按比例分高，否则日志会撑到内容全高 */
+    #pane-curve { flex:1 1 54%; }
+    #pane-log { flex:1 1 46%; }
+    #curvebox { height:auto; flex:1 1 auto; min-height:0; }
+    #logbox { height:auto; flex:1 1 auto; min-height:0; }
+    /* 横屏高度紧张：日志工具行压成一行（不许换行吃掉日志高度） */
+    #pane-log > .row { flex-wrap:nowrap; overflow-x:auto; row-gap:0; }
+    #pane-log > .row label, #pane-log > .row select { white-space:nowrap; }
+  }
+</style>
+</head>
+<body>
+
+<div id="statusline">连接中…</div>
+
+<div id="page">
+  <!-- ============ 观察窗 ============ -->
+  <section id="pane-live">
+    <div id="canvasbox"><canvas id="big"></canvas></div>
+    <div id="side">
+      <div class="row">
+        <button id="play" class="playbtn" title="播放 / 暂停（空格）">▶ 播放</button>
+        <button id="restart" title="从第 0 帧重播本局">⏮ 重播</button>
+      </div>
+      <div class="row">
+        <button id="prev" title="上一局（←）">◀ 上一局</button>
+        <button id="next" title="下一局（→）">下一局 ▶</button>
+        <button id="speed" title="倍速">1×</button>
+      </div>
+      <input type="range" id="slider" min="0" max="0" value="0" step="1">
+      <div class="row"><span class="dim" id="tlab">step 0/0</span>
+        <span class="dim" style="margin-left:auto">拖动进度条会自动暂停</span></div>
+      <div class="row">
+        <label class="dim" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="auto" checked style="width:16px;height:16px">播完自动播下一局
+        </label>
+      </div>
+      <div id="errline"></div>
+      <h3>本迭代 <span id="iterLab">-</span> · 10 局（点选 / ←→ 切换）</h3>
+      <div id="eps"></div>
+      <div id="stat"></div>
+      <div id="legend">
+        <div class="kv"><span><span class="dot" style="background:#e6550d"></span>A1 持球</span>
+                     <span><span class="dot" style="background:#fdae6b"></span>A2 掩护</span></div>
+        <div class="kv"><span><span class="dot" style="background:#3182bd"></span>D1 防守</span>
+                     <span><span class="dot" style="background:#6baed6"></span>D2 防守</span></div>
+        <div class="dim">场地 8×15m；虚线=中线；绿圈=投篮点(r=0.9m)；球员 r=0.3m，篮筐 r=0.1m。<br>
+          A1 头顶<span style="color:#2e7d32">绿条</span>=读条中（没读条就不显示；圈内未按只有虚线框）；<br>
+          <b>黑圈</b>=出手通道被遮挡：<b>A1 粗黑圈</b>（受遮挡）、挡在线上的防守者细黑圈；<br>
+          一局播完，在场地底部弹出<b>本局结束原因</b>（含 A1/A2 终局奖励）。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 右上：胜率曲线 ============ -->
+  <div id="rightcol" style="display:flex;flex-direction:column;gap:10px;min-height:0">
+    <section id="pane-curve">
+      <div class="row">
+        <span class="dim" id="curveMeta">…</span>
+        <span class="codetog dim" style="margin-left:auto">
+          <label title="投篮命中（获胜）"><input type="checkbox" id="code1" checked> 码1</label>
+          <label title="防守犯规（获胜）"><input type="checkbox" id="code2" checked> 码2</label>
+          <label title="防守撞墙（获胜）"><input type="checkbox" id="code3" checked> 码3</label>
+          <label title="防守越线（获胜）"><input type="checkbox" id="code4" checked> 码4</label>
+          <label title="防守友军误伤（获胜）"><input type="checkbox" id="code5" checked> 码5</label>
+          <label title="投篮被盖"><input type="checkbox" id="code11" checked> 码11</label>
+          <label title="进攻超时"><input type="checkbox" id="code12" checked> 码12</label>
+          <label title="己方犯规"><input type="checkbox" id="code13" checked> 码13</label>
+          <label title="己方撞墙"><input type="checkbox" id="code14" checked> 码14</label>
+          <label title="己方友军误伤"><input type="checkbox" id="code15" checked> 码15</label>
+          <label><input type="checkbox" id="curveAuto" checked> 自动</label>
+        </span>
+      </div>
+      <div id="curvebox"><canvas id="curveChart"></canvas></div>
+    </section>
+
+    <!-- ============ 右下：日志 ============ -->
+    <section id="pane-log">
+      <div class="row">
+        <span class="dim" id="logMeta">…</span>
+        <select id="logFile" style="margin-left:auto"></select>
+        <label class="dim">行 <input type="number" id="logN" value="300" min="40" max="3000" step="50" style="width:70px"></label>
+        <label class="dim"><input type="checkbox" id="logFollow" checked> 跟随末尾</label>
+        <label class="dim"><input type="checkbox" id="logAuto" checked> 自动</label>
+      </div>
+      <pre id="logbox">加载中…</pre>
+    </section>
+  </div>
+</div>
+
+<script src="chart.umd.min.js"></script>
+<script>
+/* ==================== 状态行 ==================== */
+async function loadStatus() {
+  try {
+    const r = await fetch('status.json?_=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) return;
+    const j = await r.json();
+    const bits = [];
+    bits.push(j.training_procs > 0 ? '🟢 训练中' : '⚪ 未训练');
+    if (j.progress) bits.push(`${j.progress.cur}/${j.progress.total} · ${j.progress.s_it}s/it · ETA ${j.progress.eta}`);
+    if (j.log) bits.push('log=' + j.log);
+    if (j.last_block_win != null) bits.push(`末窗胜率 ${Number(j.last_block_win).toFixed(1)}%`);
+    if (j.live) bits.push(`观察窗 iter${j.live.iter} (${Math.round(j.live.age_s)}s 前)`);
+    document.getElementById('statusline').textContent = bits.join(' · ');
+  } catch (e) { document.getElementById('statusline').textContent = '面板服务异常'; }
+}
+
+/* ==================== 观察窗（一次一局） ==================== */
+const W = 8.0, L = 15.0, P = 10;
+const AGENT_R = 0.3, BASKET_R = 0.1, SPOT_R = 0.9;   // 场景真值（layup.py）：球员 0.3m / 篮筐 0.1m / 投篮点 0.9m
+const COLORS = ['#e6550d', '#fdae6b', '#3182bd', '#6baed6'];
+// 终局码严格配色（1-5 获胜 / 11 被盖 / 12 超时 / 13-15 攻方失误）与短名
+const OUT_COLOR = { 1:'#2e7d32', 2:'#2e7d32', 3:'#2e7d32', 4:'#2e7d32', 5:'#2e7d32',
+                    11:'#7b1fa2', 12:'#616161', 13:'#c62828', 14:'#c62828', 15:'#c62828' };
+const CODE_SHORT = { 1:'命中', 2:'防守犯规', 3:'防守撞墙', 4:'防守越线', 5:'防守友军',
+                     11:'被盖', 12:'超时', 13:'攻方犯规', 14:'攻方撞墙', 15:'攻方友军' };
+function outColor(ep) { return (ep && OUT_COLOR[ep.code]) || '#455a64'; }
+function shortOut(ep) { return ep ? ((ep.code != null ? '码' + ep.code + '·' : '') + (CODE_SHORT[ep.code] || '未知')) : '—'; }
+
+/* 画布字体：中文优先微软雅黑/苹方（避免 canvas monospace 把中文回退成宋体） */
+const FONT_CJK = '"Segoe UI","Microsoft YaHei UI","Microsoft YaHei","PingFang SC","Noto Sans SC",system-ui,sans-serif';
+const FONT_NUM = '"Cascadia Mono",Consolas,"JetBrains Mono","Microsoft YaHei",ui-monospace,monospace';
+function fontStr(px, weight, family) { return `${weight || 'normal'} ${Math.max(8, Math.round(px))}px ${family || FONT_CJK}`; }
+/* 文本放不下就缩字号（横幅/角标防溢出）；返回实际字号 */
+function fitFont(X, text, maxW, px, weight, family) {
+  let size = Math.max(8, Math.round(px));
+  for (let i = 0; i < 16; i++) {
+    X.font = fontStr(size, weight, family);
+    if (X.measureText(text).width <= maxW) break;
+    size = Math.max(8, Math.round(size * 0.93));
+  }
+  return size;
+}
+function roundRect(X, x, y, w, h, r) {
+  const rr = Math.min(r, w/2, h/2);
+  X.beginPath();
+  X.moveTo(x+rr, y); X.arcTo(x+w, y, x+w, y+h, rr); X.arcTo(x+w, y+h, x, y+h, rr);
+  X.arcTo(x, y+h, x, y, rr); X.arcTo(x, y, x+w, y, rr); X.closePath();
+}
+let D = null, t = 0, playing = false, speedIdx = 1, sel = 0, S = 34;
+let autoAdv = true, endAt = 0;   // 自动连播：末帧停留 5s（真实时间）后切下一局
+let lastBanner = null;      // 供验收脚本读取（横幅三行文本/字号/实际宽度，检查是否溢出）
+const SPEEDS = [0.5, 1, 2, 4];
+let last = 0, acc = 0, canvasReady = false, dragging = false;
+
+const cvs = document.getElementById('big');
+function toX(x, s) { return P + (x + W/2) * s; }
+function toY(y, s) { return P + (L/2 - y) * s; }
+
+function showErr(e) {
+  const el = document.getElementById('errline');
+  if (el) el.textContent = '渲染异常：' + (e && e.message ? e.message : e);
+  if (window.console && console.warn) console.warn(e);
+}
+function clearErr() { const el = document.getElementById('errline'); if (el && el.textContent) el.textContent = ''; }
+
+function curEp() { return (D && D.episodes[sel]) ? D.episodes[sel] : null; }
+function curLen() { const ep = curEp(); return ep ? ep.frames.length : 1; }
+
+function setPlayLabel() {
+  const b = document.getElementById('play');
+  b.textContent = playing ? '⏸ 暂停' : '▶ 播放';
+  b.classList.toggle('playing', playing);
+}
+function setSlider(ep) {
+  const sl = document.getElementById('slider');
+  const n = ep ? ep.frames.length - 1 : 0;
+  sl.max = String(Math.max(0, n));
+  sl.value = String(t);
+  document.getElementById('tlab').textContent = `step ${t}/${n}`;
+}
+
+function layoutCanvas() {
+  try {
+    const box = document.getElementById('canvasbox');
+    const availH = box.clientHeight, availW = box.clientWidth;
+    if (availH < 80 || availW < 80) return;
+    S = Math.max(10, Math.floor(Math.min((availH - 2*P) / L, (availW - 2*P) / W)));
+    cvs.width = Math.round(W*S + 2*P);
+    cvs.height = Math.round(L*S + 2*P);
+    canvasReady = true;
+    render();
+  } catch (e) { showErr(e); }
+}
+window.addEventListener('resize', layoutCanvas);
+window.addEventListener('blur', () => { last = 0; });
+document.addEventListener('visibilitychange', () => { last = 0; });
+if (window.ResizeObserver) new ResizeObserver(() => layoutCanvas()).observe(document.getElementById('canvasbox'));
+
+/* A1 出手通道被封盖系数（逐字复刻 layup_jit.py:698-706 的稠密 block_factor_a1）
+   常量：block_sigma=0.30、block_gate_k=25、def_proximity_threshold=3×agent_radius=0.9
+   （训练渲染 layup.py:1630-1650 就是画 radius = block_f × agent_radius 的半透明黑圆） */
+const BLOCK_SIGMA = 0.30, BLOCK_GATE_K = 25, DEF_PROX = 0.9;
+function blockFactorA1(f, ep) {
+  const a1x = f[0], a1y = f[1], bx = ep.basket[0], by = ep.basket[1];
+  const vx = bx - a1x, vy = by - a1y, L2 = vx*vx + vy*vy + 1e-9;
+  let total = 0;
+  for (let k = 2; k < 4; k++) {
+    const dx = f[k*4] - a1x, dy = f[k*4+1] - a1y;
+    const tt = (dx*vx + dy*vy) / L2;
+    if (!(tt > 0 && tt < 1)) continue;                       // 必须夹在 A1 与篮筐之间
+    const px = a1x + tt*vx, py = a1y + tt*vy;
+    const perp = Math.hypot(f[k*4] - px, f[k*4+1] - py);     // 到出手线的垂距
+    const dist = Math.hypot(dx, dy);                         // 到 A1 的距离
+    const gate = 1 / (1 + Math.exp(-BLOCK_GATE_K * (DEF_PROX - dist)));
+    total += Math.exp(-perp*perp / (2*BLOCK_SIGMA*BLOCK_SIGMA)) * gate;
+  }
+  return total;
+}
+
+function drawEpisode(ep, tt) {
+  if (!cvs || !ep || !ep.frames || !ep.frames.length) return;
+  const X = cvs.getContext('2d'), s = S;
+  const big = s >= 20;
+  lastBanner = null;
+  const CW = cvs.width, CH = cvs.height;
+  X.clearRect(0, 0, CW, CH);
+  X.fillStyle = '#fbfbf7'; X.fillRect(0, 0, CW, CH);
+  // 场地
+  X.strokeStyle = '#c9d1d9'; X.lineWidth = big ? 1.8 : 1.2;
+  X.strokeRect(toX(-W/2, s), toY(L/2, s), W*s, L*s);
+  X.setLineDash([5,5]); X.strokeStyle = '#b9c2cc'; X.lineWidth = 1.2;
+  X.beginPath(); X.moveTo(toX(-W/2, s), toY(0, s)); X.lineTo(toX(W/2, s), toY(0, s)); X.stroke();
+  X.setLineDash([]);
+  // 投篮点（r=0.9m）
+  const sx = toX(ep.spot[0], s), sy = toY(ep.spot[1], s);
+  X.beginPath(); X.arc(sx, sy, SPOT_R*s, 0, 7);
+  X.fillStyle = 'rgba(76,175,80,.16)'; X.fill();
+  X.strokeStyle = 'rgba(56,142,60,.75)'; X.lineWidth = 1.5; X.stroke();
+  // 篮筐（landmark r=0.1m，另加一圈 0.35m 的圈做视觉提示 + 篮板）
+  const bx = toX(ep.basket[0], s), by = toY(ep.basket[1], s);
+  X.beginPath(); X.arc(bx, by, Math.max(BASKET_R*s, 3), 0, 7);
+  X.fillStyle = '#e6550d'; X.fill();
+  X.beginPath(); X.arc(bx, by, 0.35*s, 0, 7);
+  X.strokeStyle = 'rgba(230,85,13,.55)'; X.lineWidth = 1.5; X.stroke();
+  X.fillStyle = '#9aa4ad'; X.fillRect(bx - 0.6*s, by + 0.34*s, 1.2*s, Math.max(3, 0.07*s));
+  // 轨迹
+  const lastIdx = ep.frames.length - 1;
+  const tNow = Math.max(0, Math.min(tt | 0, lastIdx));
+  for (let a = 0; a < 4; a++) {
+    X.beginPath();
+    for (let i = 0; i <= tNow; i++) {
+      const f = ep.frames[i], x = toX(f[a*4], s), y = toY(f[a*4+1], s);
+      i ? X.lineTo(x, y) : X.moveTo(x, y);
+    }
+    X.strokeStyle = COLORS[a] + '55'; X.lineWidth = 2; X.stroke();
+  }
+  const f = ep.frames[tNow];
+  // 球员（r=0.3m）
+  for (let a = 0; a < 4; a++) {
+    const x = f[a*4], y = f[a*4+1], vx = f[a*4+2], vy = f[a*4+3];
+    const px = toX(x, s), py = toY(y, s), r = Math.max(AGENT_R*s, 6);
+    X.beginPath(); X.arc(px, py, r, 0, 7); X.fillStyle = COLORS[a]; X.fill();
+    X.strokeStyle = '#fff'; X.lineWidth = 2; X.stroke();
+    X.fillStyle = '#111'; X.font = fontStr(Math.max(7, Math.min(r*0.95, 15)), '600');
+    // 标签居中：textAlign=center + textBaseline=middle ⇒ 直接画在圆心，不加任何偏移
+    X.textAlign = 'center'; X.textBaseline = 'middle'; X.fillText(D.names[a], px, py);
+    X.textAlign = 'left'; X.textBaseline = 'alphabetic';
+    const sp = Math.hypot(vx, vy);
+    if (sp > 0.05) {
+      const len = Math.min(sp / 5, 1) * 1.1 * s;
+      const s0x = px + vx/sp*r, s0y = py - vy/sp*r;
+      X.beginPath(); X.moveTo(s0x, s0y); X.lineTo(s0x + vx/sp*len, s0y - vy/sp*len);
+      X.strokeStyle = COLORS[a]; X.lineWidth = big ? 2 : 1.4; X.stroke();
+    }
+  }
+  // 封盖压力：A1 圆圈**内部**叠半透明黑圆（半径 = block_f × 球员半径，alpha 0.6；复刻训练渲染 layup.py:1630-1650）
+  const blockF = blockFactorA1(f, ep);
+  if (blockF > 0.01) {
+    X.beginPath(); X.arc(toX(f[0], s), toY(f[1], s), Math.max(blockF * AGENT_R * s, 2), 0, 7);
+    X.fillStyle = 'rgba(0,0,0,0.6)'; X.fill();
+  }
+  // 终局是碰撞类：圈出犯规/碰撞方（同队互碰 ⇒ 两人各自一圈 + 外侧大圈）
+  const atEnd = (ep.end_step != null) && (tNow >= lastIdx);
+  if (atEnd && ep.offender && ep.offender.length) {
+    const pts = ep.offender.map(i => [toX(f[i*4], s), toY(f[i*4+1], s)]);
+    const rr = Math.max(AGENT_R*1.9*s, 11);
+    for (const p of pts) {
+      X.beginPath(); X.arc(p[0], p[1], rr, 0, 7);
+      X.strokeStyle = '#d32f2f'; X.lineWidth = big ? 3.5 : 2.4;
+      X.setLineDash([6,4]); X.stroke(); X.setLineDash([]);
+    }
+    if (pts.length >= 2) {
+      const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+      const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+      X.beginPath();
+      X.ellipse((x0+x1)/2, (y0+y1)/2, (x1-x0)/2 + rr + 4, (y1-y0)/2 + rr + 4, 0, 0, 7);
+      X.strokeStyle = 'rgba(211,47,47,.75)'; X.lineWidth = big ? 2.5 : 1.8;
+      X.setLineDash([9,6]); X.stroke(); X.setLineDash([]);
+    }
+  }
+  // A1 读条：只在开始读条后显示
+  const prog = f[16], inSpot = f[17];
+  if (prog > 0.0001) {
+    const rbx = toX(f[0], s) - 0.9*s, rby = toY(f[1], s) - 1.15*s, rw = 1.8*s, rh = Math.max(6, s*0.2);
+    X.fillStyle = '#ffffff'; X.fillRect(rbx, rby, rw, rh);
+    X.fillStyle = '#2e7d32'; X.fillRect(rbx, rby, rw * Math.min(prog, 1), rh);
+    X.strokeStyle = '#1b5e20'; X.lineWidth = 1.4; X.strokeRect(rbx, rby, rw, rh);
+    const chTxt = '读条 ' + Math.round(prog*100) + '%';
+    X.font = fontStr(Math.max(9, s*0.34), '700');
+    X.strokeStyle = 'rgba(255,255,255,.92)'; X.lineWidth = 3;
+    X.strokeText(chTxt, rbx, rby - Math.max(3, s*0.12));
+    X.fillStyle = '#1b5e20'; X.fillText(chTxt, rbx, rby - Math.max(3, s*0.12));
+  } else if (inSpot > 0.5) {   // 圈内但没按：只给淡框，不显示进度
+    const rbx = toX(f[0], s) - 0.9*s, rby = toY(f[1], s) - 1.15*s, rw = 1.8*s, rh = Math.max(6, s*0.2);
+    X.strokeStyle = '#f6b26b'; X.setLineDash([3,3]); X.lineWidth = 1.2;
+    X.strokeRect(rbx, rby, rw, rh); X.setLineDash([]);
+  }
+  // 角标（浅色圆角底衬，白底上也清晰）
+  const cornerTxt = `第${sel+1}局 · row${ep.row} · step ${tNow}/${lastIdx} · 剩${f[18].toFixed(1)}s`;
+  X.font = fontStr(Math.max(10, Math.round(s*0.33)), '600');
+  const cw2 = X.measureText(cornerTxt).width, chh = Math.max(17, s*0.5);
+  X.fillStyle = 'rgba(255,255,255,.86)'; roundRect(X, 3, 3, cw2 + 14, chh, 8); X.fill();
+  X.strokeStyle = 'rgba(0,0,0,.10)'; X.lineWidth = 1; roundRect(X, 3.5, 3.5, cw2 + 13, chh - 1, 8); X.stroke();
+  X.fillStyle = '#26313d'; X.textBaseline = 'middle';
+  X.fillText(cornerTxt, 10, 3 + chh/2 + 0.5);
+  X.textBaseline = 'alphabetic';
+  // 一局结束：结束原因画在球场上（圆角卡片 + 自动缩字号防溢出 + 4 人奖励 + 肇事方）
+  const finished = (ep.end_step != null) && (tNow >= lastIdx);
+  if (finished) {
+    const pad = Math.max(6, s*0.35);
+    const bw = Math.min(CW - 2*pad, Math.max(280, 8.2*s));
+    const bxp = (CW - bw) / 2, inner = bw - 20;
+    const rw = ep.rewards || [];
+    const line1 = '本局结束：' + ep.outcome;
+    const line2 = `A1 ${rw[0]} · A2 ${rw[1]} · D1 ${rw[2]} · D2 ${rw[3]}`;
+    let line3 = (ep.offender && ep.offender.length) ? '肇事：' + ep.offender.map(i => D.names[i]).join('+') + ' · ' : '';
+    line3 += `剩 ${ep.t_rem_last}s · step ${ep.end_step}`;
+    const s1 = fitFont(X, line1, inner, Math.max(13, s*0.44), '700');
+    const w1 = X.measureText(line1).width;
+    const s2 = fitFont(X, line2, inner, Math.max(10, s*0.30), '500', FONT_NUM);
+    const w2 = X.measureText(line2).width;
+    const s3 = fitFont(X, line3, inner, Math.max(10, s*0.30), '500');
+    const w3 = X.measureText(line3).width;
+    // 三行竖排：上下留 9px、行间 4px（每行占 1.1 倍字号，避免贴边）
+    const vpad = 16, gap = 5;   // 像素实测：vpad=9 时上下只剩 4/3px，改 16 后 ≈11/10px
+    const bh = Math.round(2*vpad + 1.1*(s1 + s2 + s3) + 2*gap);
+    const byp = CH - bh - pad;
+    const y1 = byp + vpad + 0.55*s1 + 1.5;   // +1.5：实测 ink 偏上 1.5px，补平上下留白
+    const y2 = y1 + 0.55*s1 + gap + 0.55*s2;
+    const y3 = y2 + 0.55*s2 + gap + 0.55*s3;
+    lastBanner = { line1, line2, line3, s1, s2, s3, w1, w2, w3, inner, bw, bh, bxp, byp, y1, y2, y3 };
+    X.save();
+    X.shadowColor = 'rgba(0,0,0,.35)'; X.shadowBlur = 12; X.shadowOffsetY = 3;
+    X.globalAlpha = 0.96; X.fillStyle = outColor(ep);
+    roundRect(X, bxp, byp, bw, bh, 11); X.fill();
+    X.restore();
+    X.strokeStyle = 'rgba(255,255,255,.38)'; X.lineWidth = 1;
+    roundRect(X, bxp+0.5, byp+0.5, bw-1, bh-1, 11); X.stroke();
+    X.fillStyle = '#fff'; X.textAlign = 'center'; X.textBaseline = 'middle';
+    let yy = byp + 8 + s1*0.72;
+    X.font = fontStr(s1, '700'); X.fillText(line1, CW/2, yy);
+    yy += (s1*0.72 + s2*0.72 + 3); X.font = fontStr(s2, '500', FONT_NUM); X.fillText(line2, CW/2, yy);
+    yy += (s2*0.72 + s3*0.72 + 3); X.font = fontStr(s3, '500'); X.fillText(line3, CW/2, yy);
+    X.textAlign = 'left'; X.textBaseline = 'alphabetic';
+  } else if (ep.end_step == null && tNow >= lastIdx) {
+    const note = '（本局被 rollout 窗口截断）';
+    X.font = fontStr(Math.max(10, Math.round(s*0.33)), '600');
+    const nw = X.measureText(note).width;
+    X.fillStyle = 'rgba(255,255,255,.85)'; roundRect(X, 4, CH - Math.max(24, s*0.6), nw + 14, Math.max(18, s*0.46), 7); X.fill();
+    X.fillStyle = '#6b7680'; X.textBaseline = 'middle';
+    X.fillText(note, 11, CH - Math.max(24, s*0.6) + Math.max(9, s*0.23));
+    X.textBaseline = 'alphabetic';
+  }
+}
+
+function render() {
+  try { if (D && canvasReady && curEp()) drawEpisode(curEp(), t); clearErr(); }
+  catch (e) { showErr(e); }
+}
+
+function drawStat() {
+  const ep = curEp();
+  if (!D || !ep) return;
+  document.getElementById('iterLab').textContent = D.iter;
+  const outs = {};
+  for (const e of D.episodes) outs[e.outcome] = (outs[e.outcome] || 0) + 1;
+  const summary = Object.entries(outs).map(([k, v]) => `${k}×${v}`).join(' · ');
+  document.getElementById('stat').innerHTML =
+    `<div class="kv"><span>本迭代 10 局</span><b>${summary}</b></div>` +
+    `<div class="kv"><span>选中</span><b>#${sel+1} row${ep.row}</b></div>` +
+    `<div class="kv"><span>本局长度</span><b>${ep.frames.length} 帧${ep.end_step == null ? '（截断）' : ''}</b></div>` +
+    `<div class="kv"><span>投篮点</span><b>(${ep.spot[0].toFixed(1)}, ${ep.spot[1].toFixed(1)})</b></div>`;
+}
+
+function buildChips() {
+  const box = document.getElementById('eps');
+  box.innerHTML = '';
+  D.episodes.forEach((ep, i) => {
+    const b = document.createElement('button');
+    b.className = 'chip' + (i === sel ? ' sel' : '');
+    b.style.borderLeftColor = outColor(ep);
+    b.title = ep.outcome + (ep.rewards ? `　A1 ${ep.rewards[0]} / A2 ${ep.rewards[1]} / D1 ${ep.rewards[2]} / D2 ${ep.rewards[3]}` : '');
+    b.innerHTML = `<b>${i+1}</b><span>${shortOut(ep)}</span>`;
+    b.onclick = () => selectEp(i);
+    box.appendChild(b);
+  });
+}
+
+function selectEp(i) {
+  if (!D || !D.episodes.length) return;
+  sel = ((i % D.episodes.length) + D.episodes.length) % D.episodes.length;
+  document.querySelectorAll('#eps .chip').forEach((c, k) => c.classList.toggle('sel', k === sel));
+  t = 0; acc = 0; last = 0; playing = true; dragging = false; endAt = 0;
+  setPlayLabel();
+  setSlider(curEp());
+  drawStat(); render();
+}
+
+function tick(ts) {
+  requestAnimationFrame(tick);            // 先重挂：任何异常都不会让动画循环死掉
+  try {
+    if (!last) last = ts;
+    const dt = Math.max(0, Math.min(0.5, (ts - last) / 1000)); last = ts;
+    if (D && playing && !dragging) {
+      const m = curLen();
+      if (t >= m - 1) {                      // 已在末帧
+        if (autoAdv && D.episodes.length > 1) {
+          if (!endAt) endAt = ts;            // 用时间戳算停留，倍速无关
+          else if (ts - endAt >= 5000) { endAt = 0; selectEp(sel + 1); return; }
+        } else if (playing) { playing = false; setPlayLabel(); }
+      } else {
+        acc += dt * SPEEDS[speedIdx];
+        while (acc >= 0.1) {
+          acc -= 0.1; t++;
+          if (t >= m - 1) { t = m - 1; break; }
+        }
+      }
+      const sl = document.getElementById('slider');
+      sl.value = String(t);
+      document.getElementById('tlab').textContent = `step ${t}/${m - 1}`;
+      render();
+    }
+  } catch (e) { showErr(e); }
+}
+
+async function loadLive() {
+  try {
+    const r = await fetch('live_env.json?_=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) return;
+    const j = await r.json();
+    if (!D || j.iter !== D.iter) {
+      D = j; sel = 0; t = 0; acc = 0; last = 0; playing = true;
+      buildChips(); selectEp(0);
+      if (!canvasReady) layoutCanvas();
+    }
+  } catch (e) { /* 暂无数据 */ }
+}
+
+document.getElementById('play').onclick = () => {
+  const ep = curEp();
+  if (!ep) return;
+  if (!playing && t >= ep.frames.length - 1) { t = 0; acc = 0; }   // 播完后再点播放 = 从头重播
+  endAt = 0;
+  playing = !playing; setPlayLabel(); render();
+};
+document.getElementById('restart').onclick = () => selectEp(sel);
+document.getElementById('prev').onclick = () => selectEp(sel - 1);
+document.getElementById('next').onclick = () => selectEp(sel + 1);
+document.getElementById('speed').onclick = e => {
+  speedIdx = (speedIdx + 1) % SPEEDS.length; e.target.textContent = SPEEDS[speedIdx] + '×';
+};
+document.getElementById('auto').onchange = e => {
+  autoAdv = !!e.target.checked; endAt = 0;
+  if (autoAdv && !playing) { playing = true; setPlayLabel(); }   // 勾上后立即续播
+};
+const sliderEl = document.getElementById('slider');
+function onSliderInput(e) {
+  playing = false; setPlayLabel();          // 拖动进度条 -> 暂停，由进度条驱动
+  endAt = 0;
+  const ep = curEp();
+  const n = ep ? ep.frames.length - 1 : 0;
+  t = Math.max(0, Math.min(Math.round(+e.target.value || 0), n));
+  acc = 0;
+  document.getElementById('tlab').textContent = `step ${t}/${n}`;
+  render();
+}
+sliderEl.addEventListener('input', onSliderInput);
+sliderEl.addEventListener('change', onSliderInput);
+sliderEl.addEventListener('pointerdown', () => { dragging = true; });
+window.addEventListener('pointerup', () => { dragging = false; });
+window.addEventListener('pointercancel', () => { dragging = false; });
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.key === 'ArrowLeft') selectEp(sel - 1);
+  else if (e.key === 'ArrowRight') selectEp(sel + 1);
+  else if (e.key === ' ') { e.preventDefault(); document.getElementById('play').click(); }
+});
+
+/* ==================== 胜率曲线（Chart.js 前端渲染，不用 matplotlib） ==================== */
+let curveChart = null, curveData = null;
+const CODE_META = {
+  1:  ['码1 命中',        '#3fb950'],
+  2:  ['码2 防守犯规',    '#58a6ff'],
+  3:  ['码3 防守撞墙',    '#2dd4bf'],
+  4:  ['码4 防守越线',    '#e3b341'],
+  5:  ['码5 防守友军',    '#a5d6ff'],
+  11: ['码11 被盖',       '#bc8cff'],
+  12: ['码12 超时',       '#8b949e'],
+  13: ['码13 己方犯规',   '#f85149'],
+  14: ['码14 己方撞墙',   '#ff7b72'],
+  15: ['码15 己方友军',   '#db61a2'],
+};
+const CODE_ORDER = Object.keys(CODE_META).map(Number).sort((a, b) => a - b);
+function codeOn(n) { const el = document.getElementById('code' + n); return !el || el.checked; }
+async function loadCurve() {
+  const meta = document.getElementById('curveMeta');
+  try {
+    const r = await fetch('curve.json?_=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) { meta.textContent = '取曲线数据失败 (' + r.status + ')'; return; }
+    curveData = await r.json();
+    meta.textContent = `${(curveData.files || []).join('+') || '(无日志)'} · ${curveData.n} 批 · ${curveData.mtime}`;
+    drawCurve();
+  } catch (e) { meta.textContent = '取曲线异常: ' + e; }
+}
+function drawCurve() {
+  const j = curveData;
+  if (!j || !j.points || !j.points.length) return;
+  const pts = j.points, xs = pts.map(p => p.x), xmin = xs[0], xmax = xs[xs.length - 1];
+  const mk = (label, color, get, dash) => ({
+    label, data: pts.map(p => ({ x: p.x, y: get(p) })), borderColor: color, backgroundColor: color,
+    borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, tension: 0.25, spanGaps: true, borderDash: dash || []
+  });
+  const ds = [mk('胜率', '#f0883e', p => p.win), mk('胜率(5窗均)', '#ffd166', p => p.win_ma, [6, 4])];
+  for (const n of CODE_ORDER) if (codeOn(n)) { const m = CODE_META[n]; ds.push(mk(m[0], m[1], p => p['c' + n])); }
+  ds.push({ label: '参考 50%', data: [{ x: xmin, y: 50 }, { x: xmax, y: 50 }], borderColor: '#8b949e88',
+            borderWidth: 1, borderDash: [4, 4], pointRadius: 0, spanGaps: true });
+  ds.push({ label: '参考 58%', data: [{ x: xmin, y: 58 }, { x: xmax, y: 58 }], borderColor: '#3fb95088',
+            borderWidth: 1, borderDash: [4, 4], pointRadius: 0, spanGaps: true });
+  if (curveChart) {
+    // 注意：scale 的 min/max 是构造时设的，更新数据后必须同步刷新，否则新批次落在轴范围外、曲线看起来"停更"
+    curveChart.data.datasets = ds;
+    curveChart.options.scales.x.min = xmin;
+    curveChart.options.scales.x.max = xmax;
+    curveChart.update('none');
+    return;
+  }
+  curveChart = new Chart(document.getElementById('curveChart'), {
+    type: 'line',
+    data: { datasets: ds },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false, parsing: false,
+      interaction: { mode: 'nearest', axis: 'x', intersect: false },
+      scales: {
+        x: { type: 'linear', min: xmin, max: xmax, grid: { color: '#21262d' },
+             ticks: { color: '#8b949e', maxTicksLimit: 12 } },
+        y: { min: 0, max: 100, grid: { color: '#21262d' },
+             ticks: { color: '#8b949e', callback: v => v + '%' } }
+      },
+      plugins: {
+        legend: { labels: { color: '#e6edf3', boxWidth: 12, font: { size: 10.5 } } },
+        tooltip: { callbacks: { label: c => `${c.dataset.label}: ${(c.parsed.y ?? 0).toFixed(1)}%` } }
+      }
+    }
+  });
+}
+CODE_ORDER.forEach(n => {
+  const el = document.getElementById('code' + n);
+  if (el) el.onchange = () => { if (curveData) drawCurve(); };
+});
+
+/* ==================== 日志 ==================== */
+async function loadLogList() {
+  try {
+    const r = await fetch('logs.json?_=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) return;
+    const arr = await r.json();
+    const sel2 = document.getElementById('logFile');
+    const cur = sel2.value;
+    sel2.innerHTML = '<option value="">（最新日志）</option>' +
+      arr.map(l => `<option value="${l.name}">${l.name} · ${(l.size/1048576).toFixed(1)}MB</option>`).join('');
+    if (cur && arr.some(l => l.name === cur)) sel2.value = cur;
+  } catch (e) {}
+}
+async function loadLog() {
+  const box = document.getElementById('logbox');
+  const n = +document.getElementById('logN').value || 300;
+  const file = document.getElementById('logFile').value;
+  const follow = document.getElementById('logFollow').checked;
+  try {
+    const r = await fetch('log?n=' + n + (file ? '&file=' + encodeURIComponent(file) : '') + '&_=' + Date.now(),
+                          { cache: 'no-store' });
+    if (!r.ok) { box.textContent = '取日志失败'; return; }
+    box.textContent = await r.text();
+    document.getElementById('logMeta').textContent =
+      `${file || r.headers.get('X-Log-File') || '?'} · 末 ${n} 行 · ${new Date().toLocaleTimeString()}`;
+    if (follow) box.scrollTop = box.scrollHeight;
+  } catch (e) { box.textContent = '取日志异常: ' + e; }
+}
+document.getElementById('logN').onchange = loadLog;
+document.getElementById('logFile').onchange = loadLog;
+document.getElementById('logFollow').onchange = loadLog;
+
+/* ==================== 定时器 ==================== */
+loadStatus(); loadLive(); loadCurve(); loadLogList(); loadLog(); layoutCanvas();
+setInterval(loadStatus, 5000);
+setInterval(loadLive, 2000);
+setInterval(() => { if (document.getElementById('curveAuto').checked) loadCurve(); }, 25000);
+setInterval(() => { if (document.getElementById('logAuto').checked) loadLog(); }, 5000);
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

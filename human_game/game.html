@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>人机大战 · Layup</title>
+<style>
+  :root { --bg:#101418; --panel:#1a2027; --line:#2b3540; --txt:#e8eef4; --dim:#8fa3b5; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--txt);
+              font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  body { display:flex; flex-direction:column; overflow:hidden; }
+  header { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+           padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header .title { font-weight:700; letter-spacing:.5px; }
+  header .ck { color:var(--dim); font-size:12px; }
+  .spacer { flex:1; }
+  .seg { display:flex; gap:6px; align-items:center; }
+  .seg .lab { color:var(--dim); font-size:12px; }
+  button { font:inherit; color:var(--txt); background:#232c36; border:1px solid var(--line);
+           border-radius:8px; padding:7px 12px; cursor:pointer; }
+  button:hover { background:#2b3642; }
+  button.on { background:#1f6feb; border-color:#1f6feb; }
+  button.roleA { border-color:#e8590c; } button.roleA.on { background:#e8590c; }
+  button.roleB { border-color:#1971c2; } button.roleB.on { background:#1971c2; }
+  #score { font-variant-numeric:tabular-nums; font-weight:700; font-size:15px; }
+  #score .you { color:#51cf66; } #score .bot { color:#ff8787; }
+  main { flex:1; display:flex; min-height:0; }
+  #courtbox { flex:1; position:relative; min-width:0; display:flex; align-items:center; justify-content:center; }
+  canvas { background:#fff; border-radius:10px; box-shadow:0 6px 24px rgba(0,0,0,.45);
+           touch-action:none; cursor:crosshair; }
+  #banner { position:absolute; left:50%; bottom:18px; transform:translateX(-50%);
+            min-width:min(420px,86%); padding:12px 16px; border-radius:12px; text-align:center;
+            color:#fff; box-shadow:0 8px 28px rgba(0,0,0,.5); opacity:0; pointer-events:none;
+            transition:opacity .18s ease; }
+  #banner.show { opacity:1; }
+  #banner .t { font-size:19px; font-weight:700; margin-bottom:4px; }
+  #banner .r { font-size:13px; opacity:.95; font-variant-numeric:tabular-nums; }
+  #banner .s { font-size:12px; opacity:.85; margin-top:4px; }
+  aside { width:296px; flex:none; border-left:1px solid var(--line); background:var(--panel);
+          padding:12px; overflow:auto; display:flex; flex-direction:column; gap:12px; }
+  .card { background:#141a20; border:1px solid var(--line); border-radius:10px; padding:10px; }
+  .card h4 { margin:0 0 8px; font-size:13px; color:var(--dim); font-weight:600; }
+  .kv { display:flex; justify-content:space-between; font-size:13px; padding:2px 0; }
+  .kv b { font-variant-numeric:tabular-nums; }
+  .hint { font-size:12px; color:var(--dim); line-height:1.6; }
+  .legend { display:grid; grid-template-columns:1fr 1fr; gap:6px 10px; font-size:12px; }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; }
+  #chargeWrap { height:9px; background:#0c1116; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  #chargeBar { height:100%; width:0%; background:#2f9e44; transition:width .08s linear; }
+  #status { font-size:12px; color:var(--dim); }
+  .err { color:#ff8787; }
+  @media (max-width:860px) {
+    body { overflow:auto; height:auto; }
+    main { flex-direction:column; }
+    #courtbox { height:60vh; min-height:320px; }
+    aside { width:auto; border-left:none; border-top:1px solid var(--line); }
+    header { position:sticky; top:0; z-index:5; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">🏀 人机大战</span>
+  <span class="ck" id="ckName">…</span>
+  <span class="spacer"></span>
+  <span class="seg"><span class="lab">你操作</span>
+    <button id="rA1" class="roleA" data-role="A1">A1 持球</button>
+    <button id="rA2" class="roleA" data-role="A2">A2 掩护</button>
+    <button id="rD1" class="roleB" data-role="D1">D1 防守</button>
+    <button id="rD2" class="roleB" data-role="D2">D2 防守</button>
+  </span>
+  <span class="seg"><span class="lab">速度</span>
+    <button data-spd="2">2×</button><button data-spd="1">1×</button><button data-spd="0.5">0.5×</button>
+  </span>
+  <span class="seg"><span id="score"><span class="you">你 0</span> : <span class="bot">0 电脑</span></span>
+    <button id="btnBots" class="on" title="点击切换：开着=正常对局，关掉=陪练（其他球员不干扰）">🤖 对手</button>
+    <button id="btnReset">重开</button>
+  </span>
+</header>
+<main>
+  <div id="courtbox">
+    <canvas id="cv"></canvas>
+    <div id="banner"><div class="t"></div><div class="r"></div><div class="s"></div></div>
+  </div>
+  <aside>
+    <div class="card">
+      <h4>本局</h4>
+      <div class="kv"><span>步数</span><b id="kvStep">-</b></div>
+      <div class="kv"><span>剩余时间</span><b id="kvTime">-</b></div>
+      <div class="kv"><span>投篮点</span><b id="kvSpot">-</b></div>
+      <div class="kv"><span>你（左侧）</span><b id="kvRole">A1</b></div>
+      <div class="kv"><span>读条</span><b id="kvCharge">0/10</b></div>
+      <div id="chargeWrap" style="margin-top:6px"><div id="chargeBar"></div></div>
+    </div>
+    <div class="card">
+      <h4>终局奖励（本局累计）</h4>
+      <div class="kv"><span><i class="legend"></i>A1</span><b id="rw0">0</b></div>
+      <div class="kv"><span>A2</span><b id="rw1">0</b></div>
+      <div class="kv"><span>D1</span><b id="rw2">0</b></div>
+      <div class="kv"><span>D2</span><b id="rw3">0</b></div>
+    </div>
+    <div class="card">
+      <h4>玩法</h4>
+      <div class="hint">
+        <b>按住鼠标/手指</b>：把你自己操控的球员"吸引"到光标位置；<br>
+        <b>你是 A1</b>：按住 = 跟随移动；把 A1 带进绿圈后<b>松手 = 原地刹车蓄力</b>，读条 10/10 <b>自动出手</b>（期间按住鼠标即可取消）。<br>
+        <b>你是 A2</b>：掩护队友、卡住防守（A1 由 bot 操控，读条后自动出手）。<br>
+        <b>你是防守</b>：堵住 A1 的投篮路线，逼他超时——但别撞墙、别越中线太久、读条期别碰 A1（都算犯规）。
+      </div>
+    </div>
+    <div class="card">
+      <h4>图例</h4>
+      <div class="legend">
+        <span><i style="background:#e8590c"></i>A1 持球</span>
+        <span><i style="background:#f59f00"></i>A2 掩护</span>
+        <span><i style="background:#1971c2"></i>D1 防守</span>
+        <span><i style="background:#4c6ef5"></i>D2 防守</span>
+      </div>
+      <div class="hint" style="margin-top:8px">
+        虚线 = 中线；绿圈 = 投篮点(r=0.9m)；灰块+橙环 = 篮筐；<br>
+        红色虚线圆 = 终局犯规方；A1 身上的黑圆 = 其投篮路线被遮挡程度。
+      </div>
+    </div>
+    <div id="status">连接中…</div>
+  </aside>
+</main>
+<script>
+"use strict";
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const out = { banner: document.getElementById("banner"), status: document.getElementById("status") };
+
+const COURT = { W: 8, H: 15 };           // 米
+const COLORS = ["#e8590c", "#f59f00", "#1971c2", "#4c6ef5"];
+const NAMES = ["A1", "A2", "D1", "D2"];
+const WIN_CODES = new Set([1, 2, 3, 4, 5]);
+const CODE_COLOR = { 1: "#2f9e44", 2: "#2f9e44", 3: "#2f9e44", 4: "#2f9e44", 5: "#2f9e44",
+                     11: "#7048e8", 12: "#495057", 13: "#c92a2a", 14: "#c92a2a", 15: "#c92a2a" };
+
+let S = 26, PAD = 14;                     // 每米像素 / 边距
+let st = null;                            // 最新状态
+let trails = [[], [], [], []];
+let role = "A1";
+let noBots = false;                       // 陪练模式：其他球员不干扰
+let down = false, target = null;          // 鼠标状态
+let speed = 1, baseMs = 100;   // 1× = 实时（物理步长 0.1s）；实测单步计算 ~13ms，余量充足
+let timer = null, bannerTimer = null, resetTimer = null, busy = false;
+
+function layout() {
+  const box = document.getElementById("courtbox");
+  const W = box.clientWidth - 16, H = box.clientHeight - 16;
+  S = Math.max(8, Math.floor(Math.min((W - 2 * PAD) / COURT.W, (H - 2 * PAD) / COURT.H)));
+  PAD = Math.max(10, Math.round(S * 0.5));
+  const cw = Math.round(COURT.W * S + 2 * PAD), ch = Math.round(COURT.H * S + 2 * PAD);
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr);
+  cv.style.width = cw + "px"; cv.style.height = ch + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+const X = x => PAD + (x + COURT.W / 2) * S;
+const Y = y => PAD + (COURT.H / 2 - y) * S;
+
+function drawCourt() {
+  const w = cv.width / (window.devicePixelRatio || 1), h = cv.height / (window.devicePixelRatio || 1);
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, w, h);
+  // 场地边界
+  ctx.strokeStyle = "#ced4da"; ctx.lineWidth = 2;
+  ctx.strokeRect(X(-4), Y(7.5), COURT.W * S, COURT.H * S);
+  // 中线
+  ctx.setLineDash([6, 6]); ctx.strokeStyle = "#adb5bd"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(X(-4), Y(0)); ctx.lineTo(X(4), Y(0)); ctx.stroke();
+  ctx.setLineDash([]);
+  // 投篮点
+  if (st && st.spot) {
+    ctx.beginPath(); ctx.arc(X(st.spot[0]), Y(st.spot[1]), 0.9 * S, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(47,158,68,.16)"; ctx.fill();
+    ctx.strokeStyle = "#2f9e44"; ctx.lineWidth = 2; ctx.stroke();
+  }
+  // 篮筐（篮板 + 橙环）
+  const bx = X(st && st.basket ? st.basket[0] : 0), by = Y(st && st.basket ? st.basket[1] : 6.9);
+  ctx.fillStyle = "#dee2e6"; ctx.fillRect(bx - 0.75 * S, by - 0.55 * S, 1.5 * S, 0.28 * S);
+  ctx.strokeStyle = "#e8590c"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(bx, by + 0.12 * S, 0.22 * S, 0, Math.PI * 2); ctx.stroke();
+}
+
+function drawTrails() {
+  for (let i = 0; i < 4; i++) {
+    const tr = trails[i]; if (tr.length < 2) continue;
+    ctx.strokeStyle = COLORS[i] + "55"; ctx.lineWidth = 2; ctx.beginPath();
+    ctx.moveTo(X(tr[0][0]), Y(tr[0][1]));
+    for (let k = 1; k < tr.length; k++) ctx.lineTo(X(tr[k][0]), Y(tr[k][1]));
+    ctx.stroke();
+  }
+}
+
+function drawAgent(i) {
+  const p = st.pos[i], v = st.vel[i];
+  const px = X(p[0]), py = Y(p[1]), r = Math.max(9, 0.3 * S);
+  // 轨迹尾迹点
+  ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2);
+  ctx.fillStyle = COLORS[i]; ctx.fill(); ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+  // 速度箭头
+  const sp = Math.hypot(v[0], v[1]);
+  if (sp > 0.15) {
+    const L = Math.min(1.7, sp * 0.35) * S;
+    ctx.strokeStyle = "#343a40"; ctx.lineWidth = 2.5; ctx.beginPath();
+    ctx.moveTo(px, py); ctx.lineTo(px + (v[0] / sp) * L, py - (v[1] / sp) * L); ctx.stroke();
+  }
+  // 标签
+  ctx.fillStyle = "#fff"; ctx.font = `700 ${Math.max(9, Math.min(r * 0.95, 15))}px system-ui`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(NAMES[i], px, py + 0.5);
+  // 人类标记
+  if (i === st.humanIdx) {
+    ctx.strokeStyle = "#12b886"; ctx.lineWidth = 3; ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(px, py, r + 4, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = "#12b886"; ctx.font = "700 11px system-ui";
+    ctx.fillText("你", px + r + 12, py - r - 2);
+  }
+}
+
+function drawBlockA1() {
+  if (!st || !st.blockA1 || st.blockA1 <= 0.01) return;
+  const p = st.pos[0], px = X(p[0]), py = Y(p[1]);
+  ctx.beginPath(); ctx.arc(px, py, Math.max(2, st.blockA1 * 0.3 * S), 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(0,0,0,.6)"; ctx.fill();
+}
+
+function drawCharge() {
+  if (!st || st.humanIdx !== 0) return;
+  const p = st.pos[0], px = X(p[0]), py = Y(p[1]) - Math.max(9, 0.3 * S) - 14;
+  const w = 46, h = 7, f = Math.min(1, st.charge.frames / st.charge.max);
+  ctx.fillStyle = "rgba(0,0,0,.55)"; ctx.fillRect(px - w / 2 - 1, py - 1, w + 2, h + 2);
+  ctx.fillStyle = st.charge.ready ? "#2f9e44" : "#fab005";
+  ctx.fillRect(px - w / 2, py, w * f, h);
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 1; ctx.strokeRect(px - w / 2 - 1, py - 1, w + 2, h + 2);
+}
+
+function drawTarget() {
+  if (!down || !target || !st) return;
+  const p = st.pos[st.humanIdx];
+  ctx.setLineDash([5, 5]); ctx.strokeStyle = "rgba(18,184,134,.85)"; ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.moveTo(X(p[0]), Y(p[1])); ctx.lineTo(X(target[0]), Y(target[1])); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath(); ctx.arc(X(target[0]), Y(target[1]), 7, 0, Math.PI * 2);
+  ctx.strokeStyle = "rgba(18,184,134,.95)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(X(target[0]) - 10, Y(target[1])); ctx.lineTo(X(target[0]) + 10, Y(target[1]));
+  ctx.moveTo(X(target[0]), Y(target[1]) - 10); ctx.lineTo(X(target[0]), Y(target[1]) + 10); ctx.stroke();
+}
+
+function draw() {
+  drawCourt(); if (!st) return;
+  drawTrails(); for (let i = 0; i < 4; i++) drawAgent(i);
+  drawBlockA1(); drawCharge(); drawTarget();
+}
+
+function pushTrails() {
+  if (!st) return;
+  for (let i = 0; i < 4; i++) {
+    trails[i].push([st.pos[i][0], st.pos[i][1]]);
+    if (trails[i].length > 90) trails[i].shift();
+  }
+}
+
+function updateSide() {
+  if (!st) return;
+  document.getElementById("kvStep").textContent = `${st.step} / ${st.maxSteps}`;
+  document.getElementById("kvTime").textContent = st.tRem.toFixed(1) + " s";
+  document.getElementById("kvSpot").textContent = `(${st.spot[0].toFixed(1)}, ${st.spot[1].toFixed(1)})`;
+  document.getElementById("kvRole").textContent = st.role;
+  document.getElementById("kvCharge").textContent = `${st.charge.frames}/${st.charge.max}`;
+  document.getElementById("chargeBar").style.width = Math.min(100, st.charge.frames / st.charge.max * 100) + "%";
+  for (let i = 0; i < 4; i++) document.getElementById("rw" + i).textContent = st.rewards[i].toFixed(1);
+  document.getElementById("ckName").textContent = st.ckpt || "";
+  document.getElementById("score").innerHTML =
+    `<span class="you">你 ${st.score.human}</span> : <span class="bot">${st.score.bot} 电脑</span>`;
+  document.querySelectorAll("header [data-role]").forEach(b =>
+    b.classList.toggle("on", b.dataset.role === st.role));
+  document.querySelectorAll("header [data-spd]").forEach(b =>
+    b.classList.toggle("on", parseFloat(b.dataset.spd) === speed));
+}
+
+function showBanner(o) {
+  if (!o) return;
+  const el = out.banner;
+  el.style.background = CODE_COLOR[o.code] || "#495057";
+  el.querySelector(".t").textContent = `本局结束：码${o.code} · ${o.name}`;
+  el.querySelector(".r").textContent =
+    `A1 ${o.rewards[0].toFixed(1)} · A2 ${o.rewards[1].toFixed(1)} · D1 ${o.rewards[2].toFixed(1)} · D2 ${o.rewards[3].toFixed(1)}`;
+  const who = o.humanWin === true ? "🎉 你赢了" : (o.humanWin === false ? "💀 你输了" : "平局");
+  el.querySelector(".s").textContent = `${who}${o.offenderName ? " · 肇事：" + o.offenderName : ""} · 即将自动重开…`;
+  el.classList.add("show");
+  clearTimeout(bannerTimer);
+  bannerTimer = setTimeout(() => el.classList.remove("show"), 2400);
+}
+
+async function api(path, body) {
+  const opt = body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {};
+  const r = await fetch(path, opt);
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return await r.json();
+}
+
+function apply(next, resetTrails) {
+  const prevDone = st && st.done;
+  st = next;
+  if (resetTrails || !st || st.step === 0) trails = [[], [], [], []];
+  pushTrails(); updateSide(); draw();
+  if (st.done && !prevDone) { showBanner(st.outcome); scheduleReset(); }
+}
+
+// 统一的重开入口（带上陪练模式开关）
+async function doReset(roleName) {
+  down = false;
+  clearTimeout(resetTimer);                       // 手动重开：取消排队中的自动重开
+  out.banner.classList.remove("show");            // 并立即收起上一局横幅
+  const next = await api("/api/reset", { role: roleName || role, noBots });
+  apply(next, true);
+  scheduleTick(300);
+}
+
+function scheduleReset() {
+  clearTimeout(resetTimer);
+  resetTimer = setTimeout(async () => {
+    try { await doReset(); } catch (e) { setErr(e); }
+  }, 2400);
+}
+
+function scheduleTick(ms) { clearTimeout(timer); timer = setTimeout(tick, ms == null ? baseMs / speed : ms); }
+
+async function tick() {
+  if (busy) { scheduleTick(120); return; }
+  if (!st) return;
+  if (st.done) { scheduleTick(400); return; }
+  busy = true;
+  try {
+    const body = down && target ? { x: target[0], y: target[1], down: true } : { x: 0, y: 0, down: false };
+    const next = await api("/api/step", body);
+    apply(next, false);
+    scheduleTick();
+  } catch (e) { setErr(e); scheduleTick(600); }
+  finally { busy = false; }
+}
+
+function setErr(e) {
+  out.status.innerHTML = `<span class="err">连接异常：${e.message}（后端在跑吗？）</span>`;
+}
+
+function pointerToCourt(ev) {
+  const r = cv.getBoundingClientRect();
+  const x = (ev.clientX - r.left - PAD) / S - COURT.W / 2;
+  const y = COURT.H / 2 - ((ev.clientY - r.top - PAD) / S);
+  return [Math.max(-4, Math.min(4, x)), Math.max(-7.5, Math.min(7.5, y))];
+}
+
+cv.addEventListener("pointerdown", ev => {
+  if (!st || st.done) return;
+  ev.preventDefault(); cv.setPointerCapture(ev.pointerId);
+  down = true; target = pointerToCourt(ev); draw();
+});
+cv.addEventListener("pointermove", ev => {
+  if (!down) return;
+  ev.preventDefault(); target = pointerToCourt(ev); draw();
+});
+const release = ev => {
+  if (!down) return;
+  down = false; draw();
+  if (st && !st.done) tick();          // 立刻发出"松开"这一帧（A1 圈内 = 开始蓄力）
+};
+cv.addEventListener("pointerup", release);
+cv.addEventListener("pointercancel", release);
+window.addEventListener("blur", release);
+
+document.querySelectorAll("header [data-role]").forEach(b => b.addEventListener("click", async () => {
+  role = b.dataset.role;
+  try { await doReset(); } catch (e) { setErr(e); }
+}));
+document.querySelectorAll("header [data-spd]").forEach(b => b.addEventListener("click", () => {
+  speed = parseFloat(b.dataset.spd); updateSide(); scheduleTick(60);
+}));
+document.getElementById("btnBots").addEventListener("click", async () => {
+  noBots = !noBots;
+  const btn = document.getElementById("btnBots");
+  btn.classList.toggle("on", !noBots);
+  btn.textContent = noBots ? "🎯 陪练" : "🤖 对手";
+  try { await doReset(); } catch (e) { setErr(e); }
+});
+document.getElementById("btnReset").addEventListener("click", async () => {
+  try { await doReset(); } catch (e) { setErr(e); }
+});
+window.addEventListener("resize", layout);
+
+(async function boot() {
+  layout();
+  try {
+    const meta = await api("/api/meta");
+    out.status.textContent = `模型 ${meta.ckpt} · 角色 ${(meta.names || []).join("/")} · 场次 ${meta.maxSteps} 步`;
+    apply(await api("/api/state"), true);
+    if (st && st.noBots) {
+      noBots = true;
+      const btn = document.getElementById("btnBots");
+      btn.classList.remove("on"); btn.textContent = "🎯 陪练";
+    }
+    scheduleTick(500);
+  } catch (e) { setErr(e); }
+})();
+</script>
+</body>
+</html>

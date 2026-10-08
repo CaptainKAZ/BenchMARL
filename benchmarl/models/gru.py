@@ -6,8 +6,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, MISSING
-from typing import Optional, Sequence, Type
+from dataclasses import dataclass, field, MISSING
+from typing import List, Optional, Sequence, Type
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +18,7 @@ from torchrl.data.tensor_specs import Composite, Unbounded
 
 from torchrl.modules import GRUCell, MLP, MultiAgentMLP
 
+from benchmarl.models.attention import RoleConditionedMLP
 from benchmarl.models.common import Model, ModelConfig
 from benchmarl.utils import DEVICE_TYPING
 from benchmarl.models.debug_utils import debug_print, debug_separator
@@ -405,6 +406,18 @@ class Gru(Model):
         self.compile = compile
         self.use_input_passthrough = use_input_passthrough # <--- 保存配置
 
+        # [P0-C] 角色条件化动作头：role_ids[i] = 第 i 个 agent 的角色编号
+        self.role_ids = list(kwargs.pop("role_ids", []) or [])
+        self.n_roles = int(kwargs.pop("n_roles", 0))
+        self.role_embedding_dim = int(kwargs.pop("role_embedding_dim", 32))
+        # [投篮按键] 每个角色各自的输出宽度（默认空 = 全部用 output_features）
+        self.role_out_dims = list(kwargs.pop("role_out_dims", []) or [])
+        self._role_enabled = (
+            len(self.role_ids) > 0
+            and self.n_roles > 0
+            and len(self.role_ids) == self.n_agents
+        )
+
         self.input_features = sum(
             [spec.shape[-1] for spec in self.input_spec.values(True, True)]
         )
@@ -454,15 +467,29 @@ class Gru(Model):
         }
         
         if self.output_has_agent_dim:
-            self.mlp = MultiAgentMLP(
-                n_agent_inputs=mlp_input_dim, # 使用动态计算的维度
-                n_agent_outputs=self.output_features,
-                n_agents=self.n_agents,
-                centralised=self.centralised,
-                share_params=self.share_params,
-                device=self.device,
-                **mlp_net_kwargs,
-            )
+            if self._role_enabled:
+                # [P0-C] 角色条件化动作头：共享 trunk + per-role 输出头（loc/scale 按角色分叉）
+                hidden = list(mlp_net_kwargs.get("num_cells") or [mlp_input_dim])
+                self.mlp = RoleConditionedMLP(
+                    in_dim=mlp_input_dim,
+                    out_dim=self.output_features,
+                    hidden_layers=hidden,
+                    role_ids=self.role_ids,
+                    n_roles=self.n_roles,
+                    role_embedding_dim=self.role_embedding_dim,
+                    device=self.device,
+                    role_out_dims=self.role_out_dims if len(self.role_out_dims) > 0 else None,
+                )
+            else:
+                self.mlp = MultiAgentMLP(
+                    n_agent_inputs=mlp_input_dim, # 使用动态计算的维度
+                    n_agent_outputs=self.output_features,
+                    n_agents=self.n_agents,
+                    centralised=self.centralised,
+                    share_params=self.share_params,
+                    device=self.device,
+                    **mlp_net_kwargs,
+                )
         else:
             self.mlp = nn.ModuleList(
                 [
@@ -620,6 +647,15 @@ class GruConfig(ModelConfig):
     mlp_num_cells: Sequence[int] = MISSING
     mlp_layer_class: Type[nn.Module] = MISSING
     mlp_activation_class: Type[nn.Module] = MISSING
+
+    # [P0-C] 角色条件化动作头（role_ids[i] = 第 i 个 agent 的角色编号）
+    # 注意：dataclass 要求带默认值的字段排在无默认值字段之后
+    role_ids: List[int] = field(default_factory=list)
+    n_roles: int = 0
+    role_embedding_dim: int = 32
+    # [投篮按键] per-role 输出宽度（如 [6, 4, 4]：A1 出 4 连续参数 + 2 离散 logits，
+    # 其余角色只出 4 个连续参数，补齐 0 后由适配层/layup 忽略）
+    role_out_dims: List[int] = field(default_factory=list)
 
     mlp_activation_kwargs: Optional[dict] = None
     mlp_norm_class: Type[nn.Module] = None

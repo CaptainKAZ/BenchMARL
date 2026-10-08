@@ -25,7 +25,7 @@ from benchmarl.algorithms.common import Algorithm, AlgorithmConfig
 from benchmarl.models.common import ModelConfig
 
 import functools
-from torchrl.data import CompositeSpec, BoundedTensorSpec, UnboundedContinuousTensorSpec, OneHotDiscreteTensorSpec, DiscreteTensorSpec
+from torchrl.data import Bounded, BoundedTensorSpec, OneHotDiscreteTensorSpec, Unbounded
 from tensordict.nn import CompositeDistribution
 
 import torch
@@ -278,7 +278,7 @@ class Mappo(Algorithm):
             action_spec = group_spec["action"]
             
             # 如果是混合动作容器，直接通过
-            if isinstance(action_spec, CompositeSpec):
+            if isinstance(action_spec, Composite):
                 continue 
             
             # 兼容旧逻辑：如果是普通 Spec，检查是否有 shape
@@ -291,7 +291,7 @@ class Mappo(Algorithm):
         from torch import distributions as d
         from tensordict import TensorDict
         from tensordict.nn import CompositeDistribution, TensorDictSequential, TensorDictModule
-        from torchrl.data import CompositeSpec
+        from torchrl.data import Composite
         from torchrl.modules import IndependentNormal, TanhNormal, MaskedCategorical
 
         # --- 1. 优化后的 Wrapper (带 Torch Compile Fix) ---
@@ -385,12 +385,15 @@ class Mappo(Algorithm):
             lp_key = (group, "action", name + "_log_prob")
             log_prob_keys.append(lp_key)
 
-            if isinstance(sub_spec, (BoundedTensorSpec, UnboundedContinuousTensorSpec)):
+            if isinstance(sub_spec, (Bounded, BoundedTensorSpec, Unbounded)):
                 dim = sub_spec.shape[-1] * 2 
                 distribution_map[name] = IndependentNormal if not self.use_tanh_normal else SafeTanhNormal
             else:
                 dim = sub_spec.space.n
-                distribution_map[name] = Categorical if self.action_mask_spec is None else MaskedCategorical
+                # [投篮按键] 复合路径统一用普通 Categorical：mask 由下面的
+                # "logits.masked_fill(~mask, -1e9)" 注入（比依赖 CompositeDistribution
+                # 自己传 mask 更稳）。
+                distribution_map[name] = Categorical
             
             total_param_dim += dim
             split_sizes.append(dim)
@@ -421,7 +424,7 @@ class Mappo(Algorithm):
         # (C) Param Extractor
         for name, sub_spec in action_spec.items():
             raw_key = f"{name}_raw_params"
-            if isinstance(sub_spec, (BoundedTensorSpec, UnboundedContinuousTensorSpec)):
+            if isinstance(sub_spec, (Bounded, BoundedTensorSpec, Unbounded)):
                 loc_key = (group, "params", name, "loc")
                 scale_key = (group, "params", name, "scale")
                 modules.append(TensorDictModule(
@@ -439,19 +442,47 @@ class Mappo(Algorithm):
                 ))
             else:
                 logits_key = (group, "params", name, "logits")
-                modules.append(TensorDictModule(
-                    lambda x: x, in_keys=[raw_key], out_keys=[logits_key]
-                ))
+                if self.action_mask_spec is not None:
+                    # [投篮按键] 用 (group,"action_mask") 屏蔽非法选项
+                    # （被屏蔽项 logit 压到 -1e9 -> 采样概率 ~0、log_prob 不变）
+                    modules.append(TensorDictModule(
+                        lambda logits, mask: logits.masked_fill(~mask.bool(), -1e9),
+                        in_keys=[raw_key, (group, "action_mask")],
+                        out_keys=[logits_key],
+                    ))
+                else:
+                    modules.append(TensorDictModule(
+                        lambda x: x, in_keys=[raw_key], out_keys=[logits_key]
+                    ))
 
         # --- 4. ProbabilisticActor ---
+
+        # [速度范围 B] 把连续子 spec 的物理上下界透传给 TanhNormal；否则
+        # CompositeDistribution 不传 low/high，SafeTanhNormal 退化成平凡边界 (−1,1)：
+        # 策略只能输出 1 m/s，且 loc 与事件空间失配会让 log_prob 爆到 ~1e4（NaN 诱因）。
+        extra_kwargs = {}
+        if self.use_tanh_normal:
+            for name, sub_spec in action_spec.items():
+                if not isinstance(sub_spec, Bounded):
+                    continue
+                space = getattr(sub_spec, "space", None)
+                lo = getattr(space, "low", None) if space is not None else None
+                hi = getattr(space, "high", None) if space is not None else None
+                if lo is None or hi is None:
+                    continue
+                extra_kwargs[name] = {
+                    "low": torch.as_tensor(lo, device=self.device, dtype=torch.float32),
+                    "high": torch.as_tensor(hi, device=self.device, dtype=torch.float32),
+                }
 
         dist_constructor = functools.partial(
             CompositeDistribution,
             distribution_map=distribution_map,
-            name_map=name_map
+            name_map=name_map,
+            extra_kwargs=extra_kwargs,
         )
         
-        check_spec = CompositeSpec(flat_action_spec_dict, shape=action_spec.shape)
+        check_spec = Composite(flat_action_spec_dict, shape=action_spec.shape)
 
         prob_actor = ProbabilisticActor(
             module=TensorDictSequential(*modules),
@@ -479,7 +510,7 @@ class Mappo(Algorithm):
     ) -> TensorDictModule:
         n_agents = len(self.group_map[group])
         action_spec = self.action_spec[group, "action"]
-        if isinstance(action_spec, CompositeSpec):
+        if isinstance(action_spec, Composite):
             return self._get_composite_policy(group, model_config, n_agents, action_spec)
 
         if continuous:
@@ -737,8 +768,9 @@ class BoundedNormalParamExtractor(torch.nn.Module):
     - loc   = loc_bound * tanh(raw_loc / loc_bound)                     ∈ (−loc_bound, loc_bound)
     - scale = scale_min + (scale_max − scale_min) * sigmoid(raw_scale)  ∈ (scale_min, scale_max)
 
-    采样是 upscale·tanh(z)：只要 |loc| 有界、scale 有下限，动作就贴不到 ±upscale 的饱和点，
-    log_prob 也始终有限（scale 有下限、loc 有界 ⇒ 上界可控）。
+    采样是 upscale·tanh(z)，z ~ Normal(loc, scale)：|loc| ≤ loc_bound ⇒ 动作众数最多到
+    upscale·tanh(loc_bound)（loc_bound=3、upscale=5 时 ≈4.98 m/s，已几乎用满 v_max）；
+    loc 有界 + scale 有下限 + SafeTanhNormal 的边距 clamp ⇒ log_prob 数值有界。
     """
 
     def __init__(
